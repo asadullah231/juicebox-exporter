@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "JB Export",
+  "version": "1.3.0",
+  "description": "Export candidate Name, LinkedIn URL, Job Title, Company, Location, and Match % from Juicebox.ai search results to CSV.",
+  "permissions": ["activeTab"],
+  "host_permissions": ["https://app.juicebox.ai/*"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "JB Export",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://app.juicebox.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

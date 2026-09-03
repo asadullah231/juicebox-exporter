@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>JB Export</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    width: 320px;
+    margin: 0;
+    padding: 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 13px;
+    color: #1a1a1a;
+    background: #ffffff;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .brand img {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+  }
+  h1 {
+    font-size: 15px;
+    margin: 0;
+  }
+  .subtitle {
+    color: #666;
+    margin: 0 0 14px;
+    font-size: 12px;
+  }
+  .status-box {
+    background: #f5f6f8;
+    border: 1px solid #e2e4e8;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    min-height: 40px;
+  }
+  .status-line {
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .status-line.error {
+    color: #b3261e;
+  }
+  .status-line.success {
+    color: #1e7a34;
+  }
+  .count {
+    font-weight: 600;
+  }
+  .progress-track {
+    width: 100%;
+    height: 6px;
+    background: #e2e4e8;
+    border-radius: 4px;
+    margin-top: 8px;
+    overflow: hidden;
+    display: none;
+  }
+  .progress-track.active {
+    display: block;
+  }
+  .progress-fill {
+    height: 100%;
+    width: 0%;
+    background: #2563eb;
+    transition: width 0.25s ease;
+  }
+  .progress-fill.indeterminate {
+    width: 40%;
+    animation: slide 1.1s ease-in-out infinite;
+  }
+  @keyframes slide {
+    0% { margin-left: -40%; }
+    100% { margin-left: 100%; }
+  }
+  button {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: none;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-bottom: 8px;
+  }
+  button.primary {
+    background: #2563eb;
+    color: #fff;
+  }
+  button.primary:disabled {
+    background: #a8c1f7;
+    cursor: not-allowed;
+  }
+  button.secondary {
+    background: #f0f1f4;
+    color: #1a1a1a;
+    border: 1px solid #dcdfe4;
+  }
+  button.secondary:disabled {
+    color: #9aa0a8;
+    cursor: not-allowed;
+  }
+  button.danger-link {
+    background: none;
+    color: #b3261e;
+    text-decoration: underline;
+    font-weight: 500;
+    padding: 4px;
+    margin-top: 2px;
+  }
+  .field-list {
+    font-size: 11.5px;
+    color: #888;
+    margin-top: 10px;
+    line-height: 1.5;
+  }
+  .merge-box {
+    border-top: 1px solid #e2e4e8;
+    margin-top: 12px;
+    padding-top: 12px;
+  }
+  .merge-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    cursor: pointer;
+    margin-bottom: 8px;
+  }
+  .merge-label input[type="checkbox"] {
+    margin: 0;
+  }
+  #mergeFileRow {
+    display: none;
+  }
+  #mergeFileRow.active {
+    display: block;
+  }
+  #mergeFileInput {
+    width: 100%;
+    font-size: 11.5px;
+    margin-bottom: 8px;
+  }
+  .merge-hint {
+    font-size: 11px;
+    color: #888;
+    margin: 0 0 8px;
+    line-height: 1.4;
+  }
+</style>
+</head>
+<body>
+  <div class="brand">
+    <img src="icons/icon32.png" alt="" />
+    <h1>JB Export</h1>
+  </div>
+  <p class="subtitle">Export the currently displayed Juicebox search results to CSV.</p>
+
+  <div class="status-box">
+    <div id="status" class="status-line">Checking current page…</div>
+    <div id="progressTrack" class="progress-track">
+      <div id="progressFill" class="progress-fill indeterminate"></div>
+    </div>
+  </div>
+
+  <button id="exportAllBtn" class="primary" disabled>Export CSV</button>
+  <button id="exportSelectedBtn" class="secondary" disabled>Export Selected</button>
+  <button id="cancelBtn" class="danger-link" style="display:none;">Cancel</button>
+
+  <div class="merge-box">
+    <label class="merge-label">
+      <input type="checkbox" id="mergeToggle" />
+      Merge with a previous export
+    </label>
+    <div id="mergeFileRow">
+      <p class="merge-hint">
+        Pick an earlier JB Export CSV (e.g. from a different filtered search).
+        Duplicates are removed by LinkedIn URL, or by name + company when the
+        URL is a Juicebox search link.
+      </p>
+      <input type="file" id="mergeFileInput" accept=".csv" />
+    </div>
+  </div>
+
+  <div class="field-list">
+    Exports: Name, LinkedIn URL, Job Title, Company, Location, Match %.<br />
+    Nothing is sent anywhere — the CSV is generated locally in your browser.
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 248 272" width="248" height="272">
+  <!-- Isometric cube mark, redrawn in blue -->
+  <g fill="none" stroke="#2563EB" stroke-width="16" stroke-linejoin="round" stroke-linecap="round">
+    <!-- top diamond -->
+    <polygon points="124,8 240,72 124,136 8,72" />
+    <!-- right face -->
+    <polygon points="124,136 240,72 240,200 124,264" />
+  </g>
+  <!-- left face + lower wedge, solid fill -->
+  <polygon points="8,72 124,136 124,264 8,200" fill="#2563EB" stroke="#2563EB" stroke-width="16" stroke-linejoin="round" />
+  <!-- lower-left pointed wedge (the accent triangle in the mark) -->
+  <polygon points="8,200 124,264 8,264" fill="#2563EB" />
+</svg>
