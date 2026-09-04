@@ -30,7 +30,7 @@
 // Protocol with content.js (DOM events are shared across worlds, JS objects
 // are not, so payloads are JSON strings):
 //   content.js  -> 'jbexport:session'  {"active": true|false}
-//   content.js  -> 'jbexport:resolve'  {"requestId","rowId"}
+//   content.js  -> 'jbexport:resolve'  {"requestId","rowId","name"}
 //   this script -> 'jbexport:resolved' {"requestId","url","method","clickedTag","anchorTarget"}
 //   this script -> 'jbexport:late'     {"rowId","url","method"}   (capture after the row's request timed out)
 (() => {
@@ -44,8 +44,9 @@
   const GRACE_AFTER_TIMEOUT_MS = 300;
 
   let sessionActive = false;
-  let inFlight = null;           // { rowId, requestId, settle }
-  let lastClicked = null;        // { rowId, at, settled }
+  let inFlight = null;           // { rowId, requestId, name, settle }
+  let lastClicked = null;        // { rowId, name, at, settled }
+  let prevTimedOut = null;       // the row before inFlight, if its wait expired unanswered
   let loggedMechanismOnce = false;
   let fetchLog = null;           // non-null only while the first click is being diagnosed
 
@@ -53,8 +54,34 @@
     document.dispatchEvent(new CustomEvent(name, { detail: JSON.stringify(payload) }));
   }
 
+  // Name tokens (>= 3 letters, ASCII-folded) for checking a captured slug
+  // against the candidate it is about to be attributed to. Used only to
+  // disambiguate a late answer from a fresh one; never to build a URL.
+  function nameTokens(name) {
+    return String(name || '')
+      .normalize('NFD').replace(/[̀-ͯ]/g, '')
+      .toLowerCase().split(/[^a-z]+/).filter((t) => t.length >= 3);
+  }
+  function slugMatchesName(url, name) {
+    const m = /linkedin\.com\/in\/([^/?#]+)/i.exec(String(url || ''));
+    if (!m) return false;
+    let slug = m[1];
+    try { slug = decodeURIComponent(slug); } catch (err) { /* keep raw */ }
+    slug = slug.toLowerCase().replace(/[^a-z]/g, '');
+    return nameTokens(name).some((t) => slug.includes(t));
+  }
+
   function handleCapture(url, method) {
     if (inFlight) {
+      // A previous row's answer can land while the next row is already
+      // waiting. If the slug clearly belongs to that previous candidate and
+      // not to the current one, hand it back instead of misattributing it.
+      if (prevTimedOut && Date.now() - prevTimedOut.at < LATE_WINDOW_MS &&
+          slugMatchesName(url, prevTimedOut.name) && !slugMatchesName(url, inFlight.name)) {
+        emit('jbexport:late', { rowId: prevTimedOut.rowId, url, method });
+        prevTimedOut = null;
+        return;
+      }
       inFlight.settle(url, method);
       return;
     }
@@ -111,7 +138,7 @@
     });
   }
 
-  async function resolveRow(rowId, requestId) {
+  async function resolveRow(rowId, requestId, name) {
     const row = document.querySelector(`.MuiDataGrid-row[data-id="${CSS.escape(rowId)}"]`);
     if (!row) return { url: '', method: 'row-not-mounted', clickedTag: '', anchorTarget: '' };
 
@@ -137,8 +164,9 @@
     const settled = new Promise((resolve) => {
       settleFn = (url, m) => { if (!captured) { captured = url; method = m; } resolve(url); };
     });
-    inFlight = { rowId, requestId, settle: settleFn };
-    lastClicked = { rowId, at: Date.now(), settled: false };
+    inFlight = { rowId, requestId, name, settle: settleFn };
+    prevTimedOut = lastClicked && !lastClicked.settled ? lastClicked : null;
+    lastClicked = { rowId, name, at: Date.now(), settled: false };
     const diagnosing = !loggedMechanismOnce;
     if (diagnosing) fetchLog = [];
 
@@ -184,7 +212,7 @@
     try { req = JSON.parse(e.detail); } catch (err) { return; }
     let result;
     try {
-      result = await resolveRow(String(req.rowId), req.requestId);
+      result = await resolveRow(String(req.rowId), req.requestId, req.name || '');
     } catch (err) {
       inFlight = null;
       result = { url: '', method: 'error', clickedTag: '', anchorTarget: '' };

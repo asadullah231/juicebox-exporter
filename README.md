@@ -54,7 +54,7 @@ candidate profile pages are opened.
   rewrite of the anchor's `href`, and a native anchor navigation (blocked
   with a capture-phase `preventDefault` that does not stop propagation, so
   Juicebox's React handler still runs), polls every 50ms until one fires (max
-  1.5s), and reports which mechanism it saw. `content.js` drives it over DOM
+  2.5s), and reports which mechanism it saw. `content.js` drives it over DOM
   `CustomEvent`s (shared across worlds; JSON-string payloads).
 - Juicebox's handler is asynchronous and sometimes answers more than a
   second after the click. The hooks therefore stay installed for the whole
@@ -64,6 +64,20 @@ candidate profile pages are opened.
   this, late answers opened real tabs and landed on the *next* candidate
   (an off-by-one seen in a real 499-row export). Outside a session the
   page's `window.open` behaves normally for the user's own clicks.
+- Each click looks the row up again by its `data-id` at the moment of the
+  click, never from the snapshot taken when the pass started. Juicebox
+  re-renders the grid between clicks (rows get fresh DOM nodes), so a
+  snapshot node is often detached a few rows in; using it silently skipped
+  the rest of every batch (the "4 resolved, 11 empty, repeat" pattern seen
+  in real exports). Rows that still miss (not mounted, Juicebox timed out)
+  are kept as pending and get one more attempt: whenever they are seen
+  mounted again during the scroll, and then in a dedicated retry pass over
+  the list at the end that only clicks pending rows.
+- When a late answer lands while the next row is already waiting, the slug
+  is compared against both candidates' names (accent-folded tokens of 3+
+  letters). If it matches only the earlier candidate it goes to that row;
+  otherwise it goes to the current one. This is validation of a captured
+  URL, not slug guessing: no URL is ever built from a name.
 - Resolves run one row at a time while the row is mounted. Cached rows, rows
   whose DOM href is already a profile, and (in **Export Selected** mode)
   unselected rows cost no click. Expect anywhere from 0.1s to 2.5s per
@@ -73,8 +87,9 @@ candidate profile pages are opened.
   (`aria-selected="true"` / `Mui-selected` on the row, or a checked row
   checkbox), scans the whole list so selected rows anywhere are included,
   and reports `N selected candidates (of M scanned)`.
-- The popup summarises the run (`N/M resolved, K from cache, J left empty,
-  via window.open`), and the page console logs one
+- The popup summarises the run (`N/M resolved, K from cache, R recovered on
+  retry, J left empty (x timeout, y row-not-mounted), via window.open`), and
+  the page console logs a `Run summary` JSON line plus one
   `[LinkedIn Resolver] Candidate: ... | DOM URL: ... | Captured URL: ... |
   Final URL: ...` line per click plus a one-time mechanism check.
 - Company has no grid cell at all — Juicebox doesn't render it as a column.

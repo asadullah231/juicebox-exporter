@@ -307,11 +307,16 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
       const s = d.sample || {};
       console.log('[LinkedIn Resolver] Run summary:', d);
       const resolved = d.viaWindowOpen + d.viaHrefChange + (d.late || 0);
+      const fails = d.failByMethod
+        ? Object.entries(d.failByMethod).map(([k, v]) => `${v} ${k}`).join(', ')
+        : '';
       const diagLine =
         `LinkedIn profiles: ${resolved}/${d.attempted} resolved` +
         (d.late ? ` (${d.late} arrived late)` : '') +
         (d.cached ? ` + ${d.cached} from cache` : '') +
-        (d.none ? `, ${d.none} left empty` : '') +
+        (d.retryRecovered ? `, ${d.retryRecovered} recovered on retry` : '') +
+        (d.none ? `, ${d.none} left empty${fails ? ` (${fails})` : ''}` : '') +
+        (d.skippedNotMounted ? `, ${d.skippedNotMounted} not mounted at first sight` : '') +
         (s.method ? ` (via ${s.method})` : '') + '.';
       setTimeout(() => setStatus(`${statusEl.textContent} ${diagLine}`, d.none === 0 ? 'success' : 'error'), 0);
     }

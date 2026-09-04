@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "JB Export",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "Export candidate Name, real LinkedIn profile URL, Job Title, Company, Location, and Match % from Juicebox.ai search results to CSV.",
   "permissions": ["activeTab"],
   "host_permissions": ["https://app.juicebox.ai/*"],

@@ -119,12 +119,22 @@ const linkedinUrlCache = new Map();
 
 // Per-run diagnostics so the popup can say exactly what happened during the
 // click-resolve step instead of the user having to guess from the CSV.
-const resolveDiag = { attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, none: 0, cached: 0, sample: null };
+const resolveDiag = {
+  attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, late: 0, none: 0, cached: 0,
+  skippedNotMounted: 0, retried: 0, retryRecovered: 0, failByMethod: {}, sample: null,
+};
 let resolveSeq = 0;
+// How the most recent extractActualLinkedInUrl() call ended ('window.open',
+// 'timeout', 'row-not-mounted', ...). Lets the collector decide whether a
+// miss is worth a second attempt without changing the function's contract.
+let lastResolveMethod = '';
+const MAX_RESOLVE_ATTEMPTS = 2;
+// main-world.js waits up to 2.5s plus a 300ms grace; this must outlast that.
+const RESOLVE_REPLY_TIMEOUT_MS = 3500;
 
 // Asks main-world.js to click this row's LinkedIn icon and report what URL
 // Juicebox produced. Resolves to the raw result object; never rejects.
-function requestMainWorldResolve(rowId) {
+function requestMainWorldResolve(rowId, name) {
   const requestId = `${Date.now()}-${resolveSeq++}`;
   return new Promise((resolve) => {
     let settled = false;
@@ -142,11 +152,11 @@ function requestMainWorldResolve(rowId) {
     };
     // If main-world.js never answers (not loaded, Juicebox changed markup),
     // give up on this row rather than stalling the whole export.
-    const timer = setTimeout(() => finish({ url: '', method: 'timeout', clickedTag: '' }), 2000);
+    const timer = setTimeout(() => finish({ url: '', method: 'timeout', clickedTag: '' }), RESOLVE_REPLY_TIMEOUT_MS);
 
     document.addEventListener('jbexport:resolved', onResolved);
     document.dispatchEvent(new CustomEvent('jbexport:resolve', {
-      detail: JSON.stringify({ requestId, rowId }),
+      detail: JSON.stringify({ requestId, rowId, name }),
     }));
   });
 }
@@ -164,21 +174,26 @@ async function extractActualLinkedInUrl(rowEl) {
 
   // (2) DOM already has the real thing: no click needed.
   const fromDom = canonicalLinkedInProfileUrl(domUrl);
-  if (fromDom) return fromDom;
+  if (fromDom) { lastResolveMethod = 'dom'; return fromDom; }
 
   // No LinkedIn icon at all: nothing to resolve.
-  if (!anchor && !rowEl.querySelector('[data-field="profiles"] img[src*="linkedin" i]')) return '';
+  if (!anchor && !rowEl.querySelector('[data-field="profiles"] img[src*="linkedin" i]')) {
+    lastResolveMethod = 'no-icon';
+    return '';
+  }
 
   // Cache hit from an earlier run / pass.
   if (rowId && linkedinUrlCache.has(rowId)) {
     resolveDiag.cached += 1;
+    lastResolveMethod = 'cache';
     return linkedinUrlCache.get(rowId);
   }
 
   // (1) Ask the page's own handler.
   resolveDiag.attempted += 1;
-  const result = rowId ? await requestMainWorldResolve(rowId) : { url: '', method: 'no-row-id', clickedTag: '' };
+  const result = rowId ? await requestMainWorldResolve(rowId, candidate) : { url: '', method: 'no-row-id', clickedTag: '' };
   const finalUrl = canonicalLinkedInProfileUrl(result.url);
+  lastResolveMethod = result.method || 'none';
 
   if (finalUrl) {
     if (result.method === 'window.open') resolveDiag.viaWindowOpen += 1;
@@ -186,6 +201,7 @@ async function extractActualLinkedInUrl(rowEl) {
     if (rowId) linkedinUrlCache.set(rowId, finalUrl);
   } else {
     resolveDiag.none += 1;
+    resolveDiag.failByMethod[lastResolveMethod] = (resolveDiag.failByMethod[lastResolveMethod] || 0) + 1;
   }
   if (!resolveDiag.sample) {
     resolveDiag.sample = { clickedTag: result.clickedTag || '', method: result.method, anchorTarget: result.anchorTarget || '' };
@@ -287,6 +303,7 @@ document.addEventListener('jbexport:late', (e) => {
   const row = liveRowsById && liveRowsById.get(String(data.rowId));
   if (row && !row.linkedinUrl) {
     row.linkedinUrl = url;
+    row.needsResolve = false;
     resolveDiag.none = Math.max(0, resolveDiag.none - 1);
     resolveDiag.late += 1;
     console.log(`[LinkedIn Resolver] Candidate: ${row.name || data.rowId} | late capture via ${data.method} | Final URL: ${url}`);
@@ -303,25 +320,75 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
     throw new Error('SCROLLER_NOT_FOUND');
   }
 
-  Object.assign(resolveDiag, { attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, late: 0, none: 0, cached: 0, sample: null });
+  Object.assign(resolveDiag, {
+    attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, late: 0, none: 0, cached: 0,
+    skippedNotMounted: 0, retried: 0, retryRecovered: 0, failByMethod: {}, sample: null,
+  });
 
   const byKey = new Map();
   liveRowsById = new Map();
-  // A row's LinkedIn icon is only clickable while the row is mounted in the
-  // virtualized grid, so the profile-URL resolve has to happen right when a
-  // row is first seen, not in a later pass (scrolling past unmounts it).
+
+  // The element for a row *right now*. A snapshot taken by collectVisibleRows()
+  // goes stale within a pass: each click takes up to a few seconds and
+  // Juicebox re-renders the grid in between (rows get new DOM nodes), so the
+  // node captured at snapshot time is often detached by the time its turn
+  // comes. That was the real cause of whole runs of consecutive empty rows.
+  const liveRowEl = (row) => {
+    if (row.id) {
+      const el = document.querySelector(ROW_SELECTOR + '[data-id="' + CSS.escape(String(row.id)) + '"]');
+      if (el) return el;
+    }
+    return row.rowEl && row.rowEl.isConnected ? row.rowEl : null;
+  };
+
+  const retriable = (method) => method !== 'no-icon' && method !== 'dom' && method !== 'cache';
+
   // Resolves run one at a time on purpose: main-world.js can only attribute
   // one in-flight click at a time. Already-resolved rows (cache), rows whose
   // DOM href is already a real profile, and (in "Export Selected" mode)
-  // unselected rows cost no click at all.
-  const addRows = async (rows) => {
+  // unselected rows cost no click at all. A row that missed (not mounted,
+  // Juicebox timed out) is kept as needsResolve and gets another attempt
+  // whenever it is seen mounted again, up to MAX_RESOLVE_ATTEMPTS.
+  const addRows = async (rows, opts) => {
+    const retryOnly = !!(opts && opts.retryOnly);
     for (const row of rows) {
       if (!row.hasAnyField) continue; // skeleton row mid-render, retry next pass
-      if (byKey.has(row.key)) continue;
+      if (shouldAbort()) return;
+
+      const existing = byKey.get(row.key);
+      if (existing) {
+        if (existing.needsResolve && existing.attempts < MAX_RESOLVE_ATTEMPTS) {
+          const el = liveRowEl(row);
+          if (el) {
+            existing.attempts += 1;
+            resolveDiag.retried += 1;
+            const url = await extractActualLinkedInUrl(el);
+            if (url) {
+              existing.linkedinUrl = url;
+              existing.needsResolve = false;
+              resolveDiag.retryRecovered += 1;
+            } else {
+              existing.needsResolve = retriable(lastResolveMethod);
+            }
+          }
+        }
+        continue;
+      }
+      if (retryOnly) continue;
 
       const wantsResolve = !onlySelected || row.selected;
-      if (wantsResolve && !row.linkedinUrl && row.rowEl && row.rowEl.isConnected) {
-        row.linkedinUrl = await extractActualLinkedInUrl(row.rowEl);
+      row.attempts = 0;
+      row.needsResolve = false;
+      if (wantsResolve && !row.linkedinUrl) {
+        const el = liveRowEl(row);
+        if (el) {
+          row.attempts = 1;
+          row.linkedinUrl = await extractActualLinkedInUrl(el);
+          row.needsResolve = !row.linkedinUrl && retriable(lastResolveMethod);
+        } else {
+          resolveDiag.skippedNotMounted += 1;
+          row.needsResolve = true;
+        }
       }
       // Never let a DOM node or the search URL leak into the collected data.
       delete row.rowEl;
@@ -331,9 +398,25 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
     }
   };
 
+  const pendingRetries = () =>
+    Array.from(byKey.values()).filter((r) => r.needsResolve && r.attempts < MAX_RESOLVE_ATTEMPTS).length;
+
   setResolverSession(true);
   try {
-    return await scrollAndCollect(scroller, byKey, addRows, onProgress, shouldAbort);
+    const rows = await scrollAndCollect(scroller, byKey, addRows, onProgress, shouldAbort);
+    // Second pass over the list for rows that missed the first time. Only
+    // those rows are clicked; everything else is skipped on sight.
+    if (pendingRetries() > 0 && !shouldAbort()) {
+      console.log('[LinkedIn Resolver] Retry pass for ' + pendingRetries() + ' unresolved row(s)');
+      await scrollAndCollect(
+        scroller, byKey,
+        (visible) => addRows(visible, { retryOnly: true }),
+        onProgress, shouldAbort,
+        { stopWhen: () => pendingRetries() === 0 }
+      );
+    }
+    console.log('[LinkedIn Resolver] Run summary:', JSON.stringify(resolveDiag));
+    return rows;
   } finally {
     // Leave a short window for Juicebox's last late answer, then hand the
     // page back (window.open behaves normally again for the user).
@@ -343,8 +426,12 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
   }
 }
 
-async function scrollAndCollect(scroller, byKey, addRows, onProgress, shouldAbort) {
+async function scrollAndCollect(scroller, byKey, addRows, onProgress, shouldAbort, options) {
   const originalScrollTop = scroller.scrollTop;
+  // A retry pass adds no new rows, so it must not stop on "nothing new";
+  // it runs to the bottom or until stopWhen() says nothing is left to retry.
+  const stopWhen = options && typeof options.stopWhen === 'function' ? options.stopWhen : null;
+  const retryPass = !!stopWhen;
 
   scroller.scrollTop = 0;
   await sleep(150);
@@ -385,9 +472,9 @@ async function scrollAndCollect(scroller, byKey, addRows, onProgress, shouldAbor
     const atBottom =
       scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5;
 
-    stagnantSteps = after === before ? stagnantSteps + 1 : 0;
+    stagnantSteps = after === before && !retryPass ? stagnantSteps + 1 : 0;
 
-    if ((scrollerStuck && atBottom) || stagnantSteps >= MAX_STAGNANT_STEPS) {
+    if ((scrollerStuck && atBottom) || stagnantSteps >= MAX_STAGNANT_STEPS || (stopWhen && stopWhen())) {
       break;
     }
 
