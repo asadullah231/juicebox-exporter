@@ -297,6 +297,21 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
     setStatus('Exporting CSV…');
     downloadCsv(buildCsv(finalCandidates));
 
+    // Surface what the click-resolve step actually did, so a CSV full of
+    // search links can be diagnosed from the popup instead of guessed at.
+    const d = response.resolveDiag;
+    if (d && (d.attempted > 0 || d.cached > 0)) {
+      const s = d.sample || {};
+      console.log('[LinkedIn Resolver] Run summary:', d);
+      const resolved = d.viaWindowOpen + d.viaHrefChange;
+      const diagLine =
+        `LinkedIn profiles: ${resolved}/${d.attempted} resolved` +
+        (d.cached ? ` + ${d.cached} from cache` : '') +
+        (d.none ? `, ${d.none} left empty` : '') +
+        (s.method ? ` (via ${s.method})` : '') + '.';
+      setTimeout(() => setStatus(`${statusEl.textContent} ${diagLine}`, d.none === 0 ? 'success' : 'error'), 0);
+    }
+
     if (mergedCount > 0) {
       setStatus(
         `Export completed: ${response.candidates.length} from this search + ${mergedCount} from the previous ` +

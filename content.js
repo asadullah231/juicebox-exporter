@@ -72,14 +72,145 @@ function getExpectedTotal() {
   return ariaCount ? Math.max(0, parseInt(ariaCount, 10) - 1) : null;
 }
 
+// ---------------------------------------------------------------------------
+// LinkedIn profile URL resolver
+//
+// What the DOM gives us: the LinkedIn icon in each row is an <a> whose href is
+// a LinkedIn *people-search* URL (keywords=name+company), never the profile.
+// The real /in/... URL only exists after Juicebox's own click handler runs
+// (it's not in the row's React props up front; see extractCompanyFromFiber
+// for the shape we walk). That handler runs in the page's JS world, which an
+// isolated-world content script cannot observe (each world has its own
+// `window`, so patching window.open here does nothing). So the actual
+// click-and-capture lives in main-world.js ("world": "MAIN" in the manifest)
+// and is driven from here over DOM CustomEvents, which ARE shared across
+// worlds. main-world.js captures whichever mechanism Juicebox uses
+// (window.open, an in-place href rewrite, or a native anchor navigation it
+// blocks with preventDefault) and reports back the URL plus the mechanism.
+//
+// Rules enforced here, not in main-world.js, so they hold regardless of what
+// the page does:
+//   * only a canonical https://www.linkedin.com/in/<slug>/ is accepted;
+//   * a people-search URL is never returned as the profile URL;
+//   * results are cached per Juicebox row id across export runs, so a
+//     re-export never clicks the same candidate twice;
+//   * a row that can't be resolved yields '' (never a guessed slug).
+// ---------------------------------------------------------------------------
+
+const LINKEDIN_PROFILE_RE = /^https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/in\/([^/?#\s]+)/i;
+
+// Accepts only a real profile URL; normalises host, strips query/fragment,
+// adds the trailing slash. Returns '' for anything else (search URLs, company
+// pages, junk).
+function canonicalLinkedInProfileUrl(url) {
+  const m = LINKEDIN_PROFILE_RE.exec(String(url || '').trim());
+  if (!m) return '';
+  let slug = m[1];
+  try { slug = decodeURIComponent(slug); } catch (e) { /* keep raw */ }
+  slug = slug.replace(/\/+$/, '');
+  if (!slug) return '';
+  return `https://www.linkedin.com/in/${slug}/`;
+}
+
+// Module-level: survives across export runs on the same page load.
+// Map<juiceboxRowId, canonicalProfileUrl>. Only successes are cached so a
+// transient failure (row unmounted mid-click, slow handler) can retry later.
+const linkedinUrlCache = new Map();
+
+// Per-run diagnostics so the popup can say exactly what happened during the
+// click-resolve step instead of the user having to guess from the CSV.
+const resolveDiag = { attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, none: 0, cached: 0, sample: null };
+let resolveSeq = 0;
+
+// Asks main-world.js to click this row's LinkedIn icon and report what URL
+// Juicebox produced. Resolves to the raw result object; never rejects.
+function requestMainWorldResolve(rowId) {
+  const requestId = `${Date.now()}-${resolveSeq++}`;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener('jbexport:resolved', onResolved);
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const onResolved = (e) => {
+      let data;
+      try { data = JSON.parse(e.detail); } catch (err) { return; }
+      if (data.requestId === requestId) finish(data);
+    };
+    // If main-world.js never answers (not loaded, Juicebox changed markup),
+    // give up on this row rather than stalling the whole export.
+    const timer = setTimeout(() => finish({ url: '', method: 'timeout', clickedTag: '' }), 2000);
+
+    document.addEventListener('jbexport:resolved', onResolved);
+    document.dispatchEvent(new CustomEvent('jbexport:resolve', {
+      detail: JSON.stringify({ requestId, rowId }),
+    }));
+  });
+}
+
+// Resolves the candidate's real LinkedIn profile URL for a mounted grid row.
+// Priority: (1) URL captured from Juicebox's own click behaviour,
+// (2) a canonical /in/ URL already present in the DOM href, (3) ''.
+// The row must still be mounted (virtualised grid) when this is called.
+async function extractActualLinkedInUrl(rowEl) {
+  const rowId = rowEl.getAttribute('data-id') || '';
+  const nameEl = rowEl.querySelector('[data-field="full_name"] p');
+  const candidate = cleanText(nameEl?.textContent) || rowId || '(unknown)';
+  const anchor = rowEl.querySelector('[data-field="profiles"] a[aria-label="LinkedIn"]');
+  const domUrl = anchor?.getAttribute('href') || '';
+
+  // (2) DOM already has the real thing: no click needed.
+  const fromDom = canonicalLinkedInProfileUrl(domUrl);
+  if (fromDom) return fromDom;
+
+  // No LinkedIn icon at all: nothing to resolve.
+  if (!anchor && !rowEl.querySelector('[data-field="profiles"] img[src*="linkedin" i]')) return '';
+
+  // Cache hit from an earlier run / pass.
+  if (rowId && linkedinUrlCache.has(rowId)) {
+    resolveDiag.cached += 1;
+    return linkedinUrlCache.get(rowId);
+  }
+
+  // (1) Ask the page's own handler.
+  resolveDiag.attempted += 1;
+  const result = rowId ? await requestMainWorldResolve(rowId) : { url: '', method: 'no-row-id', clickedTag: '' };
+  const finalUrl = canonicalLinkedInProfileUrl(result.url);
+
+  if (finalUrl) {
+    if (result.method === 'window.open') resolveDiag.viaWindowOpen += 1;
+    else resolveDiag.viaHrefChange += 1;
+    if (rowId) linkedinUrlCache.set(rowId, finalUrl);
+  } else {
+    resolveDiag.none += 1;
+  }
+  if (!resolveDiag.sample) {
+    resolveDiag.sample = { clickedTag: result.clickedTag || '', method: result.method, anchorTarget: result.anchorTarget || '' };
+  }
+
+  console.log(
+    `[LinkedIn Resolver] Candidate: ${candidate} | DOM URL: ${domUrl || '(none)'} | ` +
+    `Captured URL: ${result.url || '(none)'} via ${result.method} | Final URL: ${finalUrl || '(empty)'}`
+  );
+  return finalUrl;
+}
+
 function extractRow(rowEl) {
   const id = rowEl.getAttribute('data-id') || null;
 
   const nameEl = rowEl.querySelector('[data-field="full_name"] p');
   const name = cleanText(nameEl?.textContent);
 
+  // What the DOM exposes (a people-search URL, or occasionally a real /in/
+  // link). Kept separately: it feeds the "row has rendered" check and the
+  // resolver's DOM shortcut, but is never exported as the profile URL.
   const linkedinEl = rowEl.querySelector('[data-field="profiles"] a[aria-label="LinkedIn"]');
-  const linkedinUrl = linkedinEl?.getAttribute('href') || '';
+  const domLinkedinUrl = linkedinEl?.getAttribute('href') || '';
+  // Filled in by extractActualLinkedInUrl while the row is still mounted.
+  const linkedinUrl = canonicalLinkedInProfileUrl(domLinkedinUrl);
 
   const titleEl = rowEl.querySelector('[data-field="job_title_info"] p');
   const jobTitle = cleanText(titleEl?.textContent);
@@ -100,6 +231,8 @@ function extractRow(rowEl) {
     key: id || `${name}|${jobTitle}|${location}`,
     name,
     linkedinUrl,
+    domLinkedinUrl,
+    rowEl,
     jobTitle,
     location,
     matchPercent,
@@ -108,7 +241,7 @@ function extractRow(rowEl) {
     // A row that only just mounted can render before MUI fills its cells in.
     // Treat it as "not yet ready" rather than a permanent miss so the scroll
     // loop gets another chance to pick it up on a later pass.
-    hasAnyField: !!(name || linkedinUrl || jobTitle || location || matchPercent),
+    hasAnyField: !!(name || domLinkedinUrl || jobTitle || location || matchPercent),
   };
 }
 
@@ -129,13 +262,28 @@ async function collectAllCandidates(onProgress, shouldAbort) {
     throw new Error('SCROLLER_NOT_FOUND');
   }
 
+  Object.assign(resolveDiag, { attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, none: 0, cached: 0, sample: null });
+
   const byKey = new Map();
-  const addRows = (rows) => {
+  // A row's LinkedIn icon is only clickable while the row is mounted in the
+  // virtualized grid, so the profile-URL resolve has to happen right when a
+  // row is first seen, not in a later pass (scrolling past unmounts it).
+  // Resolves run one at a time on purpose: each one temporarily swaps the
+  // page's window.open, so concurrent clicks would clobber each other's
+  // capture. Already-resolved rows (cache) and rows whose DOM href is
+  // already a real profile cost no click at all.
+  const addRows = async (rows) => {
     for (const row of rows) {
       if (!row.hasAnyField) continue; // skeleton row mid-render, retry next pass
-      if (!byKey.has(row.key)) {
-        byKey.set(row.key, row);
+      if (byKey.has(row.key)) continue;
+
+      if (!row.linkedinUrl && row.rowEl && row.rowEl.isConnected) {
+        row.linkedinUrl = await extractActualLinkedInUrl(row.rowEl);
       }
+      // Never let a DOM node or the search URL leak into the collected data.
+      delete row.rowEl;
+      delete row.domLinkedinUrl;
+      byKey.set(row.key, row);
     }
   };
 
@@ -143,7 +291,7 @@ async function collectAllCandidates(onProgress, shouldAbort) {
 
   scroller.scrollTop = 0;
   await sleep(150);
-  addRows(collectVisibleRows());
+  await addRows(collectVisibleRows());
   onProgress(byKey.size, false);
 
   const stepSize = Math.max(scroller.clientHeight * 0.8, 300);
@@ -167,9 +315,9 @@ async function collectAllCandidates(onProgress, shouldAbort) {
 
     // A second read after a short extra wait gives late-mounting cells
     // (skeleton rows) a chance to fill in before we move past them.
-    addRows(collectVisibleRows());
+    await addRows(collectVisibleRows());
     await sleep(120);
-    addRows(collectVisibleRows());
+    await addRows(collectVisibleRows());
 
     const after = byKey.size;
     onProgress(after, false);
@@ -215,6 +363,7 @@ function buildExportPayload(rows, onlySelected, expectedTotal) {
     totalFound: rows.length,
     expectedTotal,
     incomplete: expectedTotal != null && rows.length < expectedTotal,
+    resolveDiag: { ...resolveDiag },
   };
 }
 

@@ -30,10 +30,40 @@ candidate profile pages are opened.
   script scrolls `.MuiDataGrid-virtualScroller` in steps, collecting and
   deduplicating rows (by `data-id`) after each step, until scrolling reaches
   the bottom or several steps in a row produce no new candidates.
-- The LinkedIn URL is read directly from the `href` on the LinkedIn icon's
-  anchor tag. Juicebox's own link is a LinkedIn people-search URL (keyed on
-  name + company), not a direct `/in/...` profile URL — that's what's in the
-  DOM, so that's what gets exported.
+- **LinkedIn profile URL.** The LinkedIn icon's `href` in the DOM is a
+  LinkedIn *people-search* URL (`/search/results/people/?keywords=name+company`),
+  not the candidate's profile. The real `/in/<slug>/` URL only exists after
+  Juicebox's own click handler runs. So `extractActualLinkedInUrl(rowEl)` in
+  `content.js`:
+  1. uses the DOM href directly if it is already a canonical `/in/` URL;
+  2. otherwise returns a cached result for that Juicebox row id, if any
+     (`Map<rowId, url>`, kept for the life of the page, so a re-export or a
+     row seen on a second scroll pass never triggers a second click);
+  3. otherwise asks `main-world.js` to click the icon once and report what
+     Juicebox produced, then validates the result: only
+     `https://www.linkedin.com/in/<slug>/` is accepted (query/fragment
+     stripped, `xx.linkedin.com` normalised to `www`). A people-search URL is
+     never accepted and a slug is never guessed from the name.
+  4. If nothing canonical came back, the field is left **empty**.
+- `main-world.js` is declared with `"world": "MAIN"` in the manifest and does
+  the click. It has to live in the page's JS world because Juicebox's handler
+  runs there: content scripts get an isolated world with a separate `window`,
+  so patching `window.open` from `content.js` captures nothing (the same code
+  works when pasted into the DevTools console, which runs in the page's
+  world). During one click it watches for `window.open(url)`, an in-place
+  rewrite of the anchor's `href`, and a native anchor navigation (blocked
+  with a capture-phase `preventDefault` that does not stop propagation, so
+  Juicebox's React handler still runs), polls every 50ms until one fires (max
+  1.5s), and reports which mechanism it saw. `content.js` drives it over DOM
+  `CustomEvent`s (shared across worlds; JSON-string payloads).
+- Resolves run one row at a time while the row is mounted, because each one
+  swaps `window.open` for its duration. Cached rows and rows whose DOM href
+  is already a profile cost no click. Expect roughly 0.1s to 0.5s per
+  uncached row on top of the normal scroll time.
+- The popup summarises the run (`N/M resolved, K from cache, J left empty,
+  via window.open`), and the page console logs one
+  `[LinkedIn Resolver] Candidate: ... | DOM URL: ... | Captured URL: ... |
+  Final URL: ...` line per click plus a one-time mechanism check.
 - Company has no grid cell at all — Juicebox doesn't render it as a column.
   It only exists on each row's underlying React data (`job_company_name`),
   so it's read by walking the DOM node's React fiber (`__reactFiber$...`)
@@ -51,9 +81,17 @@ candidate profile pages are opened.
   candidates are not reachable by scrolling at all, since Juicebox hasn't
   loaded them into the page. This is a Juicebox-side cap, not something the
   extension can bypass by scrolling harder.
-- LinkedIn links are search-result URLs, not canonical profile URLs.
 - GitHub icons have no discoverable href in the DOM (click-handler driven) —
   not exported, per spec.
+- If Juicebox has no LinkedIn match for a candidate, or its click handler
+  produces something other than a `/in/` profile URL, the LinkedIn column is
+  left empty for that row. The old people-search URL is deliberately not
+  exported in its place.
+- If Juicebox ever switches to navigating via `window.location` instead of
+  `window.open`/anchor, the resolver cannot intercept that and will report
+  `none` for every row (the page itself is never navigated away by the
+  extension). The one-time `[LinkedIn Resolver] Mechanism check` console line
+  shows what was observed.
 
 ## Getting past the 500-candidate cap
 
