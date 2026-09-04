@@ -56,10 +56,23 @@ candidate profile pages are opened.
   Juicebox's React handler still runs), polls every 50ms until one fires (max
   1.5s), and reports which mechanism it saw. `content.js` drives it over DOM
   `CustomEvent`s (shared across worlds; JSON-string payloads).
-- Resolves run one row at a time while the row is mounted, because each one
-  swaps `window.open` for its duration. Cached rows and rows whose DOM href
-  is already a profile cost no click. Expect roughly 0.1s to 0.5s per
-  uncached row on top of the normal scroll time.
+- Juicebox's handler is asynchronous and sometimes answers more than a
+  second after the click. The hooks therefore stay installed for the whole
+  export session (not per click), no tab can open during a session, and a
+  URL that arrives after a row's wait expired is still attributed to that
+  row as long as no newer row has been clicked (`jbexport:late`). Without
+  this, late answers opened real tabs and landed on the *next* candidate
+  (an off-by-one seen in a real 499-row export). Outside a session the
+  page's `window.open` behaves normally for the user's own clicks.
+- Resolves run one row at a time while the row is mounted. Cached rows, rows
+  whose DOM href is already a profile, and (in **Export Selected** mode)
+  unselected rows cost no click. Expect anywhere from 0.1s to 2.5s per
+  uncached row on top of the normal scroll time, depending on how fast
+  Juicebox answers.
+- **Export Selected** uses the grid's own selection state
+  (`aria-selected="true"` / `Mui-selected` on the row, or a checked row
+  checkbox), scans the whole list so selected rows anywhere are included,
+  and reports `N selected candidates (of M scanned)`.
 - The popup summarises the run (`N/M resolved, K from cache, J left empty,
   via window.open`), and the page console logs one
   `[LinkedIn Resolver] Candidate: ... | DOM URL: ... | Captured URL: ... |

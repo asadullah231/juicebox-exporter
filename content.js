@@ -198,6 +198,24 @@ async function extractActualLinkedInUrl(rowEl) {
   return finalUrl;
 }
 
+// MUI X DataGrid marks a selected row with aria-selected="true" and the
+// Mui-selected class; the row checkbox lives in the "__check__" column (or,
+// in some builds, inside the first data cell). Any of these counts, and any
+// checkbox inside the row that is NOT checked is ignored, so a row is only
+// "selected" when the grid itself says so.
+function isRowSelected(rowEl) {
+  if (rowEl.getAttribute('aria-selected') === 'true') return true;
+  if (rowEl.classList.contains('Mui-selected')) return true;
+  const boxes = rowEl.querySelectorAll(
+    '[data-field="__check__"] input[type="checkbox"], [data-field="full_name"] input[type="checkbox"], input[type="checkbox"]'
+  );
+  for (const box of boxes) {
+    if (box.checked) return true;
+  }
+  const aria = rowEl.querySelector('[role="checkbox"][aria-checked="true"]');
+  return !!aria;
+}
+
 function extractRow(rowEl) {
   const id = rowEl.getAttribute('data-id') || null;
 
@@ -221,8 +239,7 @@ function extractRow(rowEl) {
   const matchEl = rowEl.querySelector('[data-field="matchRate"] p');
   const matchPercent = cleanText(matchEl?.textContent);
 
-  const checkboxEl = rowEl.querySelector('[data-field="full_name"] input[type="checkbox"]');
-  const selected = !!checkboxEl?.checked;
+  const selected = isRowSelected(rowEl);
 
   const company = extractCompanyFromFiber(rowEl);
 
@@ -256,37 +273,77 @@ function sleep(ms) {
 // Scrolls the virtualized grid in steps, collecting rows as they render.
 // Stops when the scroller can no longer move (end of list) or when no new
 // unique, fully-rendered candidates appear for several consecutive steps.
-async function collectAllCandidates(onProgress, shouldAbort) {
+// Rows of the export currently running, by Juicebox row id, so a late
+// capture from main-world.js (Juicebox answering after the row's wait
+// expired) can still be written onto the right candidate.
+let liveRowsById = null;
+
+document.addEventListener('jbexport:late', (e) => {
+  let data;
+  try { data = JSON.parse(e.detail); } catch (err) { return; }
+  const url = canonicalLinkedInProfileUrl(data.url);
+  if (!url || !data.rowId) return;
+  linkedinUrlCache.set(String(data.rowId), url);
+  const row = liveRowsById && liveRowsById.get(String(data.rowId));
+  if (row && !row.linkedinUrl) {
+    row.linkedinUrl = url;
+    resolveDiag.none = Math.max(0, resolveDiag.none - 1);
+    resolveDiag.late += 1;
+    console.log(`[LinkedIn Resolver] Candidate: ${row.name || data.rowId} | late capture via ${data.method} | Final URL: ${url}`);
+  }
+});
+
+function setResolverSession(active) {
+  document.dispatchEvent(new CustomEvent('jbexport:session', { detail: JSON.stringify({ active }) }));
+}
+
+async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
   const scroller = document.querySelector(SCROLLER_SELECTOR);
   if (!scroller) {
     throw new Error('SCROLLER_NOT_FOUND');
   }
 
-  Object.assign(resolveDiag, { attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, none: 0, cached: 0, sample: null });
+  Object.assign(resolveDiag, { attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, late: 0, none: 0, cached: 0, sample: null });
 
   const byKey = new Map();
+  liveRowsById = new Map();
   // A row's LinkedIn icon is only clickable while the row is mounted in the
   // virtualized grid, so the profile-URL resolve has to happen right when a
   // row is first seen, not in a later pass (scrolling past unmounts it).
-  // Resolves run one at a time on purpose: each one temporarily swaps the
-  // page's window.open, so concurrent clicks would clobber each other's
-  // capture. Already-resolved rows (cache) and rows whose DOM href is
-  // already a real profile cost no click at all.
+  // Resolves run one at a time on purpose: main-world.js can only attribute
+  // one in-flight click at a time. Already-resolved rows (cache), rows whose
+  // DOM href is already a real profile, and (in "Export Selected" mode)
+  // unselected rows cost no click at all.
   const addRows = async (rows) => {
     for (const row of rows) {
       if (!row.hasAnyField) continue; // skeleton row mid-render, retry next pass
       if (byKey.has(row.key)) continue;
 
-      if (!row.linkedinUrl && row.rowEl && row.rowEl.isConnected) {
+      const wantsResolve = !onlySelected || row.selected;
+      if (wantsResolve && !row.linkedinUrl && row.rowEl && row.rowEl.isConnected) {
         row.linkedinUrl = await extractActualLinkedInUrl(row.rowEl);
       }
       // Never let a DOM node or the search URL leak into the collected data.
       delete row.rowEl;
       delete row.domLinkedinUrl;
       byKey.set(row.key, row);
+      if (row.id) liveRowsById.set(String(row.id), row);
     }
   };
 
+  setResolverSession(true);
+  try {
+    return await scrollAndCollect(scroller, byKey, addRows, onProgress, shouldAbort);
+  } finally {
+    // Leave a short window for Juicebox's last late answer, then hand the
+    // page back (window.open behaves normally again for the user).
+    await sleep(600);
+    setResolverSession(false);
+    liveRowsById = null;
+  }
+}
+
+async function scrollAndCollect(scroller, byKey, addRows, onProgress, shouldAbort) {
   const originalScrollTop = scroller.scrollTop;
 
   scroller.scrollTop = 0;
@@ -298,7 +355,9 @@ async function collectAllCandidates(onProgress, shouldAbort) {
   let stagnantSteps = 0;
   const MAX_STAGNANT_STEPS = 6;
   const MAX_STEPS = 4000;
-  const MAX_DURATION_MS = 10 * 60 * 1000;
+  // Generous: each uncached row can spend up to ~2.5s waiting on Juicebox's
+  // click handler, so a full 500-row export can legitimately take a while.
+  const MAX_DURATION_MS = 30 * 60 * 1000;
   const startedAt = Date.now();
   let steps = 0;
 
@@ -361,6 +420,8 @@ function buildExportPayload(rows, onlySelected, expectedTotal) {
     ok: true,
     candidates,
     totalFound: rows.length,
+    selectedCount: rows.filter((r) => r.selected).length,
+    onlySelected: !!onlySelected,
     expectedTotal,
     incomplete: expectedTotal != null && rows.length < expectedTotal,
     resolveDiag: { ...resolveDiag },
@@ -382,7 +443,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!lastResult) {
       sendResponse({ ok: false, error: 'NO_CACHED_RESULT' });
     } else {
-      sendResponse(buildExportPayload(lastResult.rows, message.onlySelected, lastResult.expectedTotal));
+      // A popup re-attaching after a reopen doesn't know which button started
+      // the run; fall back to what the run was started with.
+      const onlySelected = message.onlySelected == null ? !!lastResult.onlySelected : !!message.onlySelected;
+      sendResponse(buildExportPayload(lastResult.rows, onlySelected, lastResult.expectedTotal));
     }
     return true;
   }
@@ -414,10 +478,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               done,
             }).catch(() => {});
           },
-          () => aborted
+          () => aborted,
+          onlySelected
         );
 
-        lastResult = { rows, expectedTotal };
+        lastResult = { rows, expectedTotal, onlySelected };
         sendResponse(buildExportPayload(rows, onlySelected, expectedTotal));
       } catch (err) {
         sendResponse({ ok: false, error: err.message || 'UNKNOWN_ERROR' });

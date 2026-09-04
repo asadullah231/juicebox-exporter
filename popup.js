@@ -212,7 +212,9 @@ async function checkPage() {
         if (msg.done) {
           chrome.runtime.onMessage.removeListener(waitForDone);
           extracting = false;
-          runExtraction(false, true);
+          // undefined = "whatever mode the run was started in" (content.js
+          // remembers whether it was Export CSV or Export Selected).
+          runExtraction(undefined, true);
         }
       });
       return;
@@ -271,9 +273,10 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
       return;
     }
 
+    const selectedMode = !!response.onlySelected;
     if (response.candidates.length === 0) {
-      setStatus(onlySelected
-        ? 'No selected candidates found. Select rows and try again.'
+      setStatus(selectedMode
+        ? `No selected candidates found (scanned ${response.totalFound}). Tick the row checkboxes and try again.`
         : 'No candidates found on this page.', 'error');
       return;
     }
@@ -303,9 +306,10 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
     if (d && (d.attempted > 0 || d.cached > 0)) {
       const s = d.sample || {};
       console.log('[LinkedIn Resolver] Run summary:', d);
-      const resolved = d.viaWindowOpen + d.viaHrefChange;
+      const resolved = d.viaWindowOpen + d.viaHrefChange + (d.late || 0);
       const diagLine =
         `LinkedIn profiles: ${resolved}/${d.attempted} resolved` +
+        (d.late ? ` (${d.late} arrived late)` : '') +
         (d.cached ? ` + ${d.cached} from cache` : '') +
         (d.none ? `, ${d.none} left empty` : '') +
         (s.method ? ` (via ${s.method})` : '') + '.';
@@ -316,6 +320,11 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
       setStatus(
         `Export completed: ${response.candidates.length} from this search + ${mergedCount} from the previous ` +
         `file, merged to ${finalCandidates.length} unique candidates.`,
+        'success'
+      );
+    } else if (selectedMode) {
+      setStatus(
+        `Export completed: ${response.candidates.length} selected candidates (of ${response.totalFound} scanned).`,
         'success'
       );
     } else if (response.incomplete) {
