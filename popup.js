@@ -161,6 +161,22 @@ function downloadCsv(csvText) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+// Companion file for a run that left LinkedIn cells empty: the resolver's
+// per-row lines plus the mechanism check, so the cause can be read from the
+// file instead of the page console.
+function downloadDebugLog(lines) {
+  if (!lines || !lines.length) return;
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `juicebox-debug-${todayStamp()}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 function messageForError(error) {
   switch (error) {
     case 'NOT_JUICEBOX_PAGE':
@@ -319,6 +335,7 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
         (d.skippedNotMounted ? `, ${d.skippedNotMounted} not mounted at first sight` : '') +
         (s.method ? ` (via ${s.method})` : '') + '.';
       setTimeout(() => setStatus(`${statusEl.textContent} ${diagLine}`, d.none === 0 ? 'success' : 'error'), 0);
+      if (d.none > 0) setTimeout(() => downloadDebugLog(response.debugLog), 400);
     }
 
     if (mergedCount > 0) {

@@ -33,13 +33,15 @@
 //   content.js  -> 'jbexport:resolve'  {"requestId","rowId","name"}
 //   this script -> 'jbexport:resolved' {"requestId","url","method","clickedTag","anchorTarget"}
 //   this script -> 'jbexport:late'     {"rowId","url","method"}   (capture after the row's request timed out)
+//   this script -> 'jbexport:log'      {"line"}                     (diagnostic line for the debug file)
 (() => {
   if (window.__jbExportMainWorldReady) return;
   window.__jbExportMainWorldReady = true;
 
   const PROFILE_RE = /linkedin\.com\/in\//i;
   const SEARCH_RE = /linkedin\.com\/search\//i;
-  const MAX_WAIT_MS = 2500;      // per row, before content.js moves on
+  const MAX_WAIT_MS = 2500;      // per row, upper bound before content.js moves on
+  const MIN_WAIT_MS = 700;       // adaptive floor once Juicebox's real latency is known
   const LATE_WINDOW_MS = 10000;  // how long a timed-out row can still claim a capture
   const GRACE_AFTER_TIMEOUT_MS = 300;
 
@@ -49,9 +51,23 @@
   let prevTimedOut = null;       // the row before inFlight, if its wait expired unanswered
   let loggedMechanismOnce = false;
   let fetchLog = null;           // non-null only while the first click is being diagnosed
+  // Latency of successful captures (ms). Juicebox usually answers in well
+  // under a second; once a few samples exist the per-row wait shrinks to
+  // ~3x the slowest of them, so rows that never answer stop costing 2.5s.
+  const latencies = [];
+  function currentWaitMs() {
+    if (latencies.length < 5) return MAX_WAIT_MS;
+    const sorted = latencies.slice().sort((a, b) => a - b);
+    const p90 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))];
+    return Math.max(MIN_WAIT_MS, Math.min(MAX_WAIT_MS, p90 * 3));
+  }
 
   function emit(name, payload) {
     document.dispatchEvent(new CustomEvent(name, { detail: JSON.stringify(payload) }));
+  }
+  function log(line) {
+    console.info(line);
+    emit('jbexport:log', { line });
   }
 
   // Name tokens (>= 3 letters, ASCII-folded) for checking a captured slug
@@ -69,6 +85,13 @@
     try { slug = decodeURIComponent(slug); } catch (err) { /* keep raw */ }
     slug = slug.toLowerCase().replace(/[^a-z]/g, '');
     return nameTokens(name).some((t) => slug.includes(t));
+  }
+
+  // Juicebox answered with a people-search URL: it has no profile for this
+  // candidate. That is a final answer, so the row settles at once instead
+  // of waiting out the full timeout (this alone was most of the slowness).
+  function handleNoProfile(url) {
+    if (inFlight) inFlight.settle('', 'search-url');
   }
 
   function handleCapture(url, method) {
@@ -99,6 +122,7 @@
     const u = String(url || '');
     if (sessionActive) {
       if (PROFILE_RE.test(u)) handleCapture(u, 'window.open');
+      else if (SEARCH_RE.test(u) || /linkedin\.com/i.test(u)) handleNoProfile(u);
       return null; // never open a tab during an export
     }
     return originalOpen.call(window, url, ...rest); // user's own clicks behave normally
@@ -160,10 +184,17 @@
 
     let captured = '';
     let method = 'none';
+    let answered = false;
     let settleFn = null;
+    const clickedAt = Date.now();
     const settled = new Promise((resolve) => {
-      settleFn = (url, m) => { if (!captured) { captured = url; method = m; } resolve(url); };
+      settleFn = (url, m) => {
+        if (!answered) { answered = true; captured = url; method = m; }
+        if (url) latencies.push(Date.now() - clickedAt);
+        resolve(url);
+      };
     });
+    const waitMs = currentWaitMs();
     inFlight = { rowId, requestId, name, settle: settleFn };
     prevTimedOut = lastClicked && !lastClicked.settled ? lastClicked : null;
     lastClicked = { rowId, name, at: Date.now(), settled: false };
@@ -181,23 +212,31 @@
             return h;
           }
           return '';
-        }, MAX_WAIT_MS, 50),
+        }, waitMs, 50),
       ]);
     } finally {
       inFlight = null;
-      if (captured) lastClicked.settled = true;
+      if (answered) lastClicked.settled = true;
       if (diagnosing) {
         loggedMechanismOnce = true;
-        console.info(
-          `[LinkedIn Resolver] Mechanism check: clicked <${clickTarget.tagName.toLowerCase()}>, ` +
+        const insideAnchor = !!clickTarget.closest('a');
+        log(
+          `[LinkedIn Resolver] Mechanism check: clicked <${clickTarget.tagName.toLowerCase()}> (inside <a>: ${insideAnchor}), ` +
           `anchor target="${anchorTarget}", href before click was ${SEARCH_RE.test(hrefBefore) ? 'a people-search URL' : (hrefBefore || '(none)')}, ` +
-          `observed: ${method}${fetchLog.length ? `, fetches during click: ${fetchLog.join(' ; ')}` : ', no fetch calls during click'}`
+          `observed: ${method} after ${Date.now() - clickedAt}ms${fetchLog.length ? `, fetches during click: ${fetchLog.join(' ; ')}` : ', no fetch calls during click'}`
         );
         fetchLog = null;
       }
     }
 
-    return { url: captured, method: captured ? method : 'timeout', clickedTag: clickTarget.tagName, anchorTarget };
+    return {
+      url: captured,
+      method: answered ? method : 'timeout',
+      waitedMs: Date.now() - clickedAt,
+      waitMs,
+      clickedTag: clickTarget.tagName,
+      anchorTarget,
+    };
   }
 
   document.addEventListener('jbexport:session', (e) => {

@@ -78,6 +78,19 @@ candidate profile pages are opened.
   letters). If it matches only the earlier candidate it goes to that row;
   otherwise it goes to the current one. This is validation of a captured
   URL, not slug guessing: no URL is ever built from a name.
+- Speed. When Juicebox has no profile for a candidate its handler opens the
+  LinkedIn *people-search* URL instead. That is treated as a final answer
+  (`search-url`) and the row settles immediately, rather than waiting out
+  the full timeout and then being retried, which is what made large exports
+  crawl. The per-row wait also adapts: after five successful captures it
+  drops to about three times the slowest of them (floor 0.7s, cap 2.5s).
+  Only rows that were never actually asked (not mounted, error) get a
+  second attempt; `search-url` and `timeout` are final.
+- When a run leaves any LinkedIn cell empty, a companion
+  `juicebox-debug-YYYY-MM-DD.txt` is downloaded next to the CSV with one
+  line per click (candidate, DOM URL, captured URL, method, time waited)
+  plus the mechanism check. Share that file to diagnose a bad run; it
+  contains candidate names and LinkedIn URLs, nothing else.
 - Resolves run one row at a time while the row is mounted. Cached rows, rows
   whose DOM href is already a profile, and (in **Export Selected** mode)
   unselected rows cost no click. Expect anywhere from 0.1s to 2.5s per

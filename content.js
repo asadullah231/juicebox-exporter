@@ -128,6 +128,20 @@ let resolveSeq = 0;
 // 'timeout', 'row-not-mounted', ...). Lets the collector decide whether a
 // miss is worth a second attempt without changing the function's contract.
 let lastResolveMethod = '';
+// Diagnostic lines for the debug file the popup downloads when rows were
+// left empty; mirrors what the page console shows. Capped so a huge run
+// cannot grow it without bound.
+const debugLog = [];
+const DEBUG_LOG_MAX = 3000;
+function debug(line) {
+  console.log(line);
+  if (debugLog.length < DEBUG_LOG_MAX) debugLog.push(line);
+}
+document.addEventListener('jbexport:log', (e) => {
+  let data;
+  try { data = JSON.parse(e.detail); } catch (err) { return; }
+  if (data && data.line && debugLog.length < DEBUG_LOG_MAX) debugLog.push(String(data.line));
+});
 const MAX_RESOLVE_ATTEMPTS = 2;
 // main-world.js waits up to 2.5s plus a 300ms grace; this must outlast that.
 const RESOLVE_REPLY_TIMEOUT_MS = 3500;
@@ -207,9 +221,11 @@ async function extractActualLinkedInUrl(rowEl) {
     resolveDiag.sample = { clickedTag: result.clickedTag || '', method: result.method, anchorTarget: result.anchorTarget || '' };
   }
 
-  console.log(
+  debug(
     `[LinkedIn Resolver] Candidate: ${candidate} | DOM URL: ${domUrl || '(none)'} | ` +
-    `Captured URL: ${result.url || '(none)'} via ${result.method} | Final URL: ${finalUrl || '(empty)'}`
+    `Captured URL: ${result.url || '(none)'} via ${result.method}` +
+    (result.waitedMs != null ? ` in ${result.waitedMs}ms (limit ${result.waitMs}ms)` : '') +
+    ` | Final URL: ${finalUrl || '(empty)'}`
   );
   return finalUrl;
 }
@@ -306,7 +322,7 @@ document.addEventListener('jbexport:late', (e) => {
     row.needsResolve = false;
     resolveDiag.none = Math.max(0, resolveDiag.none - 1);
     resolveDiag.late += 1;
-    console.log(`[LinkedIn Resolver] Candidate: ${row.name || data.rowId} | late capture via ${data.method} | Final URL: ${url}`);
+    debug(`[LinkedIn Resolver] Candidate: ${row.name || data.rowId} | late capture via ${data.method} | Final URL: ${url}`);
   }
 });
 
@@ -320,6 +336,7 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
     throw new Error('SCROLLER_NOT_FOUND');
   }
 
+  const runStartedAt = Date.now();
   Object.assign(resolveDiag, {
     attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, late: 0, none: 0, cached: 0,
     skippedNotMounted: 0, retried: 0, retryRecovered: 0, failByMethod: {}, sample: null,
@@ -327,6 +344,8 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
 
   const byKey = new Map();
   liveRowsById = new Map();
+  debugLog.length = 0;
+  debugLog.push(`[LinkedIn Resolver] Run started ${new Date().toISOString()} | onlySelected=${!!onlySelected} | ${location.href}`);
 
   // The element for a row *right now*. A snapshot taken by collectVisibleRows()
   // goes stale within a pass: each click takes up to a few seconds and
@@ -341,7 +360,10 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
     return row.rowEl && row.rowEl.isConnected ? row.rowEl : null;
   };
 
-  const retriable = (method) => method !== 'no-icon' && method !== 'dom' && method !== 'cache';
+  // Only misses that were never really asked get a second attempt. A
+  // 'search-url' answer (Juicebox has no profile) and a full timeout are
+  // final; clicking again just costs the same wait a second time.
+  const retriable = (method) => method === 'row-not-mounted' || method === 'error' || method === 'no-row-id';
 
   // Resolves run one at a time on purpose: main-world.js can only attribute
   // one in-flight click at a time. Already-resolved rows (cache), rows whose
@@ -407,7 +429,7 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
     // Second pass over the list for rows that missed the first time. Only
     // those rows are clicked; everything else is skipped on sight.
     if (pendingRetries() > 0 && !shouldAbort()) {
-      console.log('[LinkedIn Resolver] Retry pass for ' + pendingRetries() + ' unresolved row(s)');
+      debug('[LinkedIn Resolver] Retry pass for ' + pendingRetries() + ' unresolved row(s)');
       await scrollAndCollect(
         scroller, byKey,
         (visible) => addRows(visible, { retryOnly: true }),
@@ -415,7 +437,8 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
         { stopWhen: () => pendingRetries() === 0 }
       );
     }
-    console.log('[LinkedIn Resolver] Run summary:', JSON.stringify(resolveDiag));
+    debug('[LinkedIn Resolver] Run summary: ' + JSON.stringify(resolveDiag) +
+      ' | elapsed ' + Math.round((Date.now() - runStartedAt) / 1000) + 's');
     return rows;
   } finally {
     // Leave a short window for Juicebox's last late answer, then hand the
@@ -512,6 +535,7 @@ function buildExportPayload(rows, onlySelected, expectedTotal) {
     expectedTotal,
     incomplete: expectedTotal != null && rows.length < expectedTotal,
     resolveDiag: { ...resolveDiag },
+    debugLog: debugLog.slice(),
   };
 }
 
