@@ -34,12 +34,31 @@ function csvEscape(value) {
   return str;
 }
 
+// Splits a display name into first and last name: first word is the first
+// name, everything after it is the last name (so "Hans-Werner Bracher" ->
+// "Hans-Werner" / "Bracher" and "Maria de la Cruz" -> "Maria" / "de la Cruz").
+// A single-word name goes into First Name with an empty Last Name. Common
+// trailing credentials (", MBA", "(she/her)") are stripped first.
+function splitName(name) {
+  const cleaned = String(name || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .split(',')[0]
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return { firstName: '', lastName: '' };
+  const parts = cleaned.split(' ');
+  return { firstName: parts[0], lastName: parts.slice(1).join(' ') };
+}
+
 function buildCsv(candidates) {
-  const header = ['Name', 'LinkedIn Profile URL', 'Job Title', 'Company', 'Location', 'Match %'];
+  const header = ['Name', 'First Name', 'Last Name', 'LinkedIn Profile URL', 'Job Title', 'Company', 'Location', 'Match %'];
   const lines = [header.map(csvEscape).join(',')];
   for (const c of candidates) {
+    const split = splitName(c.name);
     lines.push([
       csvEscape(c.name),
+      csvEscape(c.firstName || split.firstName),
+      csvEscape(c.lastName || split.lastName),
       csvEscape(c.linkedinUrl),
       csvEscape(c.jobTitle),
       csvEscape(c.company),
@@ -97,6 +116,8 @@ function candidatesFromCsvText(text) {
   const header = rows[0].map((h) => h.trim().toLowerCase());
   const idx = (label) => header.indexOf(label);
   const iName = idx('name');
+  const iFirst = idx('first name');
+  const iLast = idx('last name');
   const iLinkedin = idx('linkedin profile url');
   const iTitle = idx('job title');
   const iCompany = idx('company');
@@ -105,6 +126,8 @@ function candidatesFromCsvText(text) {
 
   return rows.slice(1).map((r) => ({
     name: iName >= 0 ? (r[iName] || '') : '',
+    firstName: iFirst >= 0 ? (r[iFirst] || '') : '',
+    lastName: iLast >= 0 ? (r[iLast] || '') : '',
     linkedinUrl: iLinkedin >= 0 ? (r[iLinkedin] || '') : '',
     jobTitle: iTitle >= 0 ? (r[iTitle] || '') : '',
     company: iCompany >= 0 ? (r[iCompany] || '') : '',

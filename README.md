@@ -1,6 +1,6 @@
 # JB Export
 
-Chrome extension (Manifest V3) that exports Name, LinkedIn URL, Job Title,
+Chrome extension (Manifest V3) that exports Name, First Name, Last Name, LinkedIn URL, Job Title,
 Company, Location, and Match % from a Juicebox.ai search results page to a
 CSV file. Everything runs locally in the browser — no external servers, no
 candidate profile pages are opened.
@@ -22,6 +22,13 @@ candidate profile pages are opened.
 5. The CSV downloads automatically as `juicebox-candidates-YYYY-MM-DD.csv`
 
 ## How it works
+
+- **First Name / Last Name** are split from the display name in the CSV:
+  first word = first name, the rest = last name (a single-word name has an
+  empty Last Name). Parenthesised pronouns and trailing ", MBA"-style
+  credentials are stripped before the split. Older CSVs merged in via
+  "Merge with a previous export" keep their own First/Last Name columns if
+  present, otherwise they are split the same way.
 
 - The results table is a Material-UI X DataGrid. Rows are read via stable
   `data-field` attributes (`full_name`, `profiles`, `job_title_info`,
