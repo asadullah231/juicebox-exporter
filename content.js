@@ -128,6 +128,10 @@ let resolveSeq = 0;
 // 'timeout', 'row-not-mounted', ...). Lets the collector decide whether a
 // miss is worth a second attempt without changing the function's contract.
 let lastResolveMethod = '';
+// Set once main-world.js has answered a row through Juicebox's own endpoint
+// instead of a click. From then on rows are resolved a few at a time.
+let apiMode = false;
+const API_CONCURRENCY = 4;
 // Diagnostic lines for the debug file the popup downloads when rows were
 // left empty; mirrors what the page console shows. Capped so a huge run
 // cannot grow it without bound.
@@ -180,6 +184,13 @@ function requestMainWorldResolve(rowId, name) {
 // (2) a canonical /in/ URL already present in the DOM href, (3) ''.
 // The row must still be mounted (virtualised grid) when this is called.
 async function extractActualLinkedInUrl(rowEl) {
+  const r = await resolveLinkedInUrlDetailed(rowEl);
+  return r.url;
+}
+
+// Same as extractActualLinkedInUrl but also reports how the row ended, so
+// parallel callers do not race on a shared "last method" variable.
+async function resolveLinkedInUrlDetailed(rowEl) {
   const rowId = rowEl.getAttribute('data-id') || '';
   const nameEl = rowEl.querySelector('[data-field="full_name"] p');
   const candidate = cleanText(nameEl?.textContent) || rowId || '(unknown)';
@@ -188,19 +199,19 @@ async function extractActualLinkedInUrl(rowEl) {
 
   // (2) DOM already has the real thing: no click needed.
   const fromDom = canonicalLinkedInProfileUrl(domUrl);
-  if (fromDom) { lastResolveMethod = 'dom'; return fromDom; }
+  if (fromDom) { lastResolveMethod = 'dom'; return { url: fromDom, method: 'dom' }; }
 
   // No LinkedIn icon at all: nothing to resolve.
   if (!anchor && !rowEl.querySelector('[data-field="profiles"] img[src*="linkedin" i]')) {
     lastResolveMethod = 'no-icon';
-    return '';
+    return { url: '', method: 'no-icon' };
   }
 
   // Cache hit from an earlier run / pass.
   if (rowId && linkedinUrlCache.has(rowId)) {
     resolveDiag.cached += 1;
     lastResolveMethod = 'cache';
-    return linkedinUrlCache.get(rowId);
+    return { url: linkedinUrlCache.get(rowId), method: 'cache' };
   }
 
   // (1) Ask the page's own handler.
@@ -208,9 +219,11 @@ async function extractActualLinkedInUrl(rowEl) {
   const result = rowId ? await requestMainWorldResolve(rowId, candidate) : { url: '', method: 'no-row-id', clickedTag: '' };
   const finalUrl = canonicalLinkedInProfileUrl(result.url);
   lastResolveMethod = result.method || 'none';
+  if (typeof result.method === 'string' && result.method.startsWith('api')) apiMode = true;
 
   if (finalUrl) {
     if (result.method === 'window.open') resolveDiag.viaWindowOpen += 1;
+    else if (result.method === 'api') resolveDiag.viaApi = (resolveDiag.viaApi || 0) + 1;
     else resolveDiag.viaHrefChange += 1;
     if (rowId) linkedinUrlCache.set(rowId, finalUrl);
   } else {
@@ -227,7 +240,7 @@ async function extractActualLinkedInUrl(rowEl) {
     (result.waitedMs != null ? ` in ${result.waitedMs}ms (limit ${result.waitMs}ms)` : '') +
     ` | Final URL: ${finalUrl || '(empty)'}`
   );
-  return finalUrl;
+  return { url: finalUrl, method: lastResolveMethod };
 }
 
 // MUI X DataGrid marks a selected row with aria-selected="true" and the
@@ -338,9 +351,10 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
 
   const runStartedAt = Date.now();
   Object.assign(resolveDiag, {
-    attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, late: 0, none: 0, cached: 0,
+    attempted: 0, viaWindowOpen: 0, viaHrefChange: 0, viaApi: 0, late: 0, none: 0, cached: 0,
     skippedNotMounted: 0, retried: 0, retryRecovered: 0, failByMethod: {}, sample: null,
   });
+  apiMode = false;
 
   const byKey = new Map();
   liveRowsById = new Map();
@@ -371,28 +385,49 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
   // unselected rows cost no click at all. A row that missed (not mounted,
   // Juicebox timed out) is kept as needsResolve and gets another attempt
   // whenever it is seen mounted again, up to MAX_RESOLVE_ATTEMPTS.
+  // One resolve job: re-find the row at run time, ask, record the outcome.
+  const runJob = async (job) => {
+    if (shouldAbort()) return;
+    const el = liveRowEl(job) || null;
+    if (!el) {
+      if (!job.retry) { resolveDiag.skippedNotMounted += 1; job.target.needsResolve = true; }
+      return;
+    }
+    job.target.attempts += 1;
+    if (job.retry) resolveDiag.retried += 1;
+    const r = await resolveLinkedInUrlDetailed(el);
+    if (r.url) {
+      job.target.linkedinUrl = r.url;
+      job.target.needsResolve = false;
+      if (job.retry) resolveDiag.retryRecovered += 1;
+    } else if (!job.target.linkedinUrl) {
+      job.target.needsResolve = retriable(r.method);
+    }
+  };
+
+  // Click resolves must be one at a time (main-world.js attributes a single
+  // in-flight click). Endpoint resolves are tied to their own request, so
+  // once apiMode is on they run a few at a time.
+  const runJobs = async (jobs) => {
+    let i = 0;
+    while (i < jobs.length) {
+      if (shouldAbort()) return;
+      const width = apiMode ? API_CONCURRENCY : 1;
+      await Promise.all(jobs.slice(i, i + width).map(runJob));
+      i += width;
+    }
+  };
+
   const addRows = async (rows, opts) => {
     const retryOnly = !!(opts && opts.retryOnly);
+    const jobs = [];
     for (const row of rows) {
       if (!row.hasAnyField) continue; // skeleton row mid-render, retry next pass
-      if (shouldAbort()) return;
 
       const existing = byKey.get(row.key);
       if (existing) {
-        if (existing.needsResolve && existing.attempts < MAX_RESOLVE_ATTEMPTS) {
-          const el = liveRowEl(row);
-          if (el) {
-            existing.attempts += 1;
-            resolveDiag.retried += 1;
-            const url = await extractActualLinkedInUrl(el);
-            if (url) {
-              existing.linkedinUrl = url;
-              existing.needsResolve = false;
-              resolveDiag.retryRecovered += 1;
-            } else {
-              existing.needsResolve = retriable(lastResolveMethod);
-            }
-          }
+        if (existing.needsResolve && existing.attempts < MAX_RESOLVE_ATTEMPTS && liveRowEl(row)) {
+          jobs.push({ target: existing, id: row.id, rowEl: row.rowEl, retry: true });
         }
         continue;
       }
@@ -402,15 +437,7 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
       row.attempts = 0;
       row.needsResolve = false;
       if (wantsResolve && !row.linkedinUrl) {
-        const el = liveRowEl(row);
-        if (el) {
-          row.attempts = 1;
-          row.linkedinUrl = await extractActualLinkedInUrl(el);
-          row.needsResolve = !row.linkedinUrl && retriable(lastResolveMethod);
-        } else {
-          resolveDiag.skippedNotMounted += 1;
-          row.needsResolve = true;
-        }
+        jobs.push({ target: row, id: row.id, rowEl: row.rowEl, retry: false });
       }
       // Never let a DOM node or the search URL leak into the collected data.
       delete row.rowEl;
@@ -418,6 +445,7 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
       byKey.set(row.key, row);
       if (row.id) liveRowsById.set(String(row.id), row);
     }
+    await runJobs(jobs);
   };
 
   const pendingRetries = () =>

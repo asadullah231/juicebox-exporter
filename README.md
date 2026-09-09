@@ -78,6 +78,21 @@ candidate profile pages are opened.
   letters). If it matches only the earlier candidate it goes to that row;
   otherwise it goes to the current one. This is validation of a captured
   URL, not slug guessing: no URL is ever built from a name.
+- Fast path (v1.6). The first click shows which endpoint Juicebox's handler
+  calls for the row (`/api/profile/external?searchResultId=<row id>`, the
+  id being the row's `data-id`). Once that is confirmed on a real click,
+  every later row is resolved by calling the same endpoint directly with the
+  page's own session, four at a time, and reading the `/in/` URL out of the
+  response. Each request carries its own row id, so an answer can never be
+  attributed to the wrong candidate, and a row costs one request instead of
+  a click plus a wait. A row whose request fails falls back to the click
+  path. A run of a few hundred rows takes well under a minute this way.
+- Click-path attribution. Juicebox sometimes answers a click two or three
+  rows late. Rows that were clicked but not answered are kept as pending,
+  and a capture that does not fit the in-flight candidate's name (or arrives
+  faster than a fresh click ever answers) is matched against those pending
+  rows before anything is attributed. This closed a chain of off-by-one
+  URLs seen in a real 25-row run.
 - Speed. When Juicebox has no profile for a candidate its handler opens the
   LinkedIn *people-search* URL instead. That is treated as a final answer
   (`search-url`) and the row settles immediately, rather than waiting out

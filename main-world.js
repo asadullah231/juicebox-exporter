@@ -18,6 +18,16 @@
 // late capture is attributed to the last row that was clicked, as long as
 // no newer row has been clicked since.
 //
+// Fast path: the first click reveals which Juicebox endpoint the handler
+// calls for the row (observed: GET /api/profile/external?searchResultId=<id>,
+// where <id> equals the row's data-id). Once that is confirmed on a real
+// click, later rows are resolved by calling the same endpoint directly with
+// the page's own session, in parallel, and reading the /in/ URL out of the
+// response. Request and response are tied together, so a late answer can
+// never land on the wrong candidate, and each row costs one request instead
+// of a click plus a wait. If the endpoint ever fails the row falls back to
+// the click path below.
+//
 // Mechanisms watched during a click (none is assumed):
 //   * window.open(url)                    -> "window.open"
 //   * the anchor's href being rewritten   -> "href-change"
@@ -48,7 +58,17 @@
   let sessionActive = false;
   let inFlight = null;           // { rowId, requestId, name, settle }
   let lastClicked = null;        // { rowId, name, at, settled }
-  let prevTimedOut = null;       // the row before inFlight, if its wait expired unanswered
+  // Rows that were clicked but never answered (within LATE_WINDOW_MS). A
+  // capture that does not belong to the in-flight row is matched against
+  // these by name, so a slow answer two or three rows back still lands on
+  // its own candidate (a chain of off-by-one URLs was seen without this).
+  let pending = [];              // [{ rowId, name, at }]
+  const FAST_ANSWER_MS = 400;    // faster than Juicebox has ever answered a fresh click
+  // Learned from the first real click: the endpoint Juicebox calls for a
+  // row, with the row id replaced by {id}. null until verified.
+  let apiTemplate = null;
+  let apiSampleLogged = false;
+  let clickQueue = Promise.resolve(); // click path is strictly one at a time
   let loggedMechanismOnce = false;
   let fetchLog = null;           // non-null only while the first click is being diagnosed
   // Latency of successful captures (ms). Juicebox usually answers in well
@@ -94,26 +114,40 @@
     if (inFlight) inFlight.settle('', 'search-url');
   }
 
+  function prunePending() {
+    const now = Date.now();
+    pending = pending.filter((p) => now - p.at < LATE_WINDOW_MS);
+  }
+
+  // Which pending row (if any) a capture belongs to: by name first, then,
+  // for an answer that arrived faster than a fresh click can, the most
+  // recently clicked pending row.
+  function claimPending(url, arrivedFastAfterClick) {
+    prunePending();
+    let idx = pending.findIndex((p) => slugMatchesName(url, p.name));
+    if (idx < 0 && arrivedFastAfterClick && pending.length) idx = pending.length - 1;
+    if (idx < 0) return null;
+    return pending.splice(idx, 1)[0];
+  }
+
   function handleCapture(url, method) {
     if (inFlight) {
-      // A previous row's answer can land while the next row is already
-      // waiting. If the slug clearly belongs to that previous candidate and
-      // not to the current one, hand it back instead of misattributing it.
-      if (prevTimedOut && Date.now() - prevTimedOut.at < LATE_WINDOW_MS &&
-          slugMatchesName(url, prevTimedOut.name) && !slugMatchesName(url, inFlight.name)) {
-        emit('jbexport:late', { rowId: prevTimedOut.rowId, url, method });
-        prevTimedOut = null;
-        return;
+      const sinceClick = Date.now() - inFlight.clickedAt;
+      // An answer that does not fit the in-flight candidate but does fit a
+      // row still waiting for one goes to that row instead.
+      if (!slugMatchesName(url, inFlight.name)) {
+        const owner = claimPending(url, sinceClick < FAST_ANSWER_MS);
+        if (owner) {
+          emit('jbexport:late', { rowId: owner.rowId, url, method });
+          return;
+        }
       }
       inFlight.settle(url, method);
       return;
     }
-    // A capture with no request in flight: Juicebox answered after the row's
-    // wait expired. Give it to that row if nothing newer was clicked since.
-    if (lastClicked && Date.now() - lastClicked.at < LATE_WINDOW_MS) {
-      emit('jbexport:late', { rowId: lastClicked.rowId, url, method });
-      lastClicked = null;
-    }
+    // No request in flight: a row's wait expired before Juicebox answered.
+    const owner = claimPending(url, true);
+    if (owner) emit('jbexport:late', { rowId: owner.rowId, url, method });
   }
 
   // ---- hooks: installed once, active only while an export session runs ----
@@ -141,12 +175,52 @@
 
   const originalFetch = window.fetch;
   window.fetch = function (input, init) {
-    if (fetchLog) {
-      const u = typeof input === 'string' ? input : (input && input.url) || '';
-      fetchLog.push(`${(init && init.method) || 'GET'} ${u}`);
+    const u = typeof input === 'string' ? input : (input && input.url) || '';
+    if (fetchLog) fetchLog.push(`${(init && init.method) || 'GET'} ${u}`);
+    // Learn the per-row endpoint from a real click: only accepted when the
+    // request carries exactly the row id we just clicked.
+    if (!apiTemplate && sessionActive && inFlight && u) {
+      const m = /[?&]searchResultId=([^&#]+)/.exec(u);
+      if (m && decodeURIComponent(m[1]) === inFlight.rowId) {
+        apiTemplate = u.replace(m[1], '{id}');
+        log(`[LinkedIn Resolver] API learned from click: ${apiTemplate}`);
+      }
     }
     return originalFetch.apply(this, arguments);
   };
+
+  // Direct call of the learned endpoint. Returns null when the call could
+  // not be trusted (network/HTTP error), so the caller falls back to a click.
+  async function resolveViaApi(rowId) {
+    if (!apiTemplate) return null;
+    const url = apiTemplate.replace('{id}', encodeURIComponent(rowId));
+    const startedAt = Date.now();
+    let res;
+    try {
+      res = await originalFetch.call(window, url, { credentials: 'include' });
+    } catch (err) {
+      return null;
+    }
+    if (!res.ok) {
+      log(`[LinkedIn Resolver] API returned HTTP ${res.status} for a row; falling back to click`);
+      return null;
+    }
+    const text = await res.text();
+    if (!apiSampleLogged) {
+      apiSampleLogged = true;
+      log(`[LinkedIn Resolver] API response sample (${text.length} chars): ${text.slice(0, 300).replace(/\s+/g, ' ')}`);
+    }
+    const m = /https?:\\?\/\\?\/(?:[a-z]{2,3}\.)?linkedin\.com\\?\/in\\?\/[^"'\s<>\\]+/i.exec(text);
+    const found = m ? m[0].replace(/\\\//g, '/') : '';
+    return {
+      url: found,
+      method: found ? 'api' : 'api-no-profile',
+      waitedMs: Date.now() - startedAt,
+      waitMs: 0,
+      clickedTag: '',
+      anchorTarget: '',
+    };
+  }
 
   // ---- per-row resolve ----
   function waitFor(check, timeoutMs, intervalMs) {
@@ -195,9 +269,8 @@
       };
     });
     const waitMs = currentWaitMs();
-    inFlight = { rowId, requestId, name, settle: settleFn };
-    prevTimedOut = lastClicked && !lastClicked.settled ? lastClicked : null;
-    lastClicked = { rowId, name, at: Date.now(), settled: false };
+    inFlight = { rowId, requestId, name, clickedAt, settle: settleFn };
+    lastClicked = { rowId, name, at: clickedAt, settled: false };
     const diagnosing = !loggedMechanismOnce;
     if (diagnosing) fetchLog = [];
 
@@ -217,6 +290,7 @@
     } finally {
       inFlight = null;
       if (answered) lastClicked.settled = true;
+      else pending.push({ rowId, name, at: clickedAt });
       if (diagnosing) {
         loggedMechanismOnce = true;
         const insideAnchor = !!clickTarget.closest('a');
@@ -243,18 +317,31 @@
     let req;
     try { req = JSON.parse(e.detail); } catch (err) { return; }
     sessionActive = !!req.active;
-    if (!sessionActive) { inFlight = null; lastClicked = null; }
+    if (!sessionActive) { inFlight = null; lastClicked = null; pending = []; }
   });
 
   document.addEventListener('jbexport:resolve', async (e) => {
     let req;
     try { req = JSON.parse(e.detail); } catch (err) { return; }
-    let result;
+    const rowId = String(req.rowId);
+    let result = null;
     try {
-      result = await resolveRow(String(req.rowId), req.requestId, req.name || '');
+      result = await resolveViaApi(rowId);
     } catch (err) {
-      inFlight = null;
-      result = { url: '', method: 'error', clickedTag: '', anchorTarget: '' };
+      result = null;
+    }
+    if (!result) {
+      // Click path, serialised: only one click can be attributed at a time.
+      const run = clickQueue.then(async () => {
+        try {
+          return await resolveRow(rowId, req.requestId, req.name || '');
+        } catch (err) {
+          inFlight = null;
+          return { url: '', method: 'error', clickedTag: '', anchorTarget: '' };
+        }
+      });
+      clickQueue = run.catch(() => {});
+      result = await run;
     }
     emit('jbexport:resolved', { requestId: req.requestId, ...result });
   });

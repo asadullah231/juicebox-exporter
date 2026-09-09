@@ -322,7 +322,7 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
     if (d && (d.attempted > 0 || d.cached > 0)) {
       const s = d.sample || {};
       console.log('[LinkedIn Resolver] Run summary:', d);
-      const resolved = d.viaWindowOpen + d.viaHrefChange + (d.late || 0);
+      const resolved = d.viaWindowOpen + d.viaHrefChange + (d.viaApi || 0) + (d.late || 0);
       const fails = d.failByMethod
         ? Object.entries(d.failByMethod).map(([k, v]) => `${v} ${k}`).join(', ')
         : '';
