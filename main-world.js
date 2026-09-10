@@ -252,8 +252,12 @@
       apiSampleLogged = true;
       log(`[LinkedIn Resolver] API response sample (${text.length} chars): ${text.slice(0, 300).replace(/\s+/g, ' ')}`);
     }
-    const m = /https?:\\?\/\\?\/(?:[a-z]{2,3}\.)?linkedin\.com\\?\/in\\?\/[^"'\s<>\\]+/i.exec(text);
-    const found = m ? m[0].replace(/\\\//g, '/') : '';
+    // Juicebox answers {"result":"linkedin.com/in/<slug>"}: no scheme, no
+    // www. The scheme is optional here and a bare host is normalised, so
+    // content.js's canonical check accepts it.
+    const m = /(?:https?:\\?\/\\?\/)?(?:(?:www|[a-z]{2})\.)?linkedin\.com\\?\/in\\?\/[^"'\s<>\\]+/i.exec(text);
+    let found = m ? m[0].replace(/\\\//g, '/') : '';
+    if (found && !/^https?:\/\//i.test(found)) found = 'https://' + found;
     if (found) apiStats.ok += 1; else apiStats.noProfile += 1;
     return {
       url: found,

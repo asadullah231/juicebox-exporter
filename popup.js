@@ -7,6 +7,7 @@ const cancelBtn = document.getElementById('cancelBtn');
 const mergeToggle = document.getElementById('mergeToggle');
 const mergeFileRow = document.getElementById('mergeFileRow');
 const mergeFileInput = document.getElementById('mergeFileInput');
+const debugToggle = document.getElementById('debugToggle');
 
 let currentTabId = null;
 let extracting = false;
@@ -359,8 +360,8 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
         (d.skippedNotMounted ? `, ${d.skippedNotMounted} not mounted at first sight` : '') +
         (s.method ? ` (via ${s.method})` : '') + '.';
       setTimeout(() => setStatus(`${statusEl.textContent} ${diagLine}`, d.none === 0 ? 'success' : 'error'), 0);
-      // Always saved for now: the speed/selection reports need it.
-      setTimeout(() => downloadDebugLog(response.debugLog), 400);
+      // Only when the user asked for it in the popup.
+      if (debugToggle && debugToggle.checked) setTimeout(() => downloadDebugLog(response.debugLog), 400);
     }
 
     if (mergedCount > 0) {

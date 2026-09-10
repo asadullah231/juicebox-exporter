@@ -108,7 +108,7 @@ candidate profile pages are opened.
   drops to about three times the slowest of them (floor 0.7s, cap 2.5s).
   Only rows that were never actually asked (not mounted, error) get a
   second attempt; `search-url` and `timeout` are final.
-- When a run leaves any LinkedIn cell empty, a companion
+- When the "Also save a debug log" box in the popup is ticked, a companion
   `juicebox-debug-YYYY-MM-DD.txt` is downloaded next to the CSV with one
   line per click (candidate, DOM URL, captured URL, method, time waited)
   plus the mechanism check. Share that file to diagnose a bad run; it
