@@ -128,11 +128,15 @@ candidate profile pages are opened.
   `[LinkedIn Resolver] Candidate: ... | DOM URL: ... | Captured URL: ... |
   Final URL: ...` line per click plus a one-time mechanism check.
 - Company has no grid cell at all — Juicebox doesn't render it as a column.
-  It only exists on each row's underlying React data (`job_company_name`),
-  so it's read by walking the DOM node's React fiber (`__reactFiber$...`)
-  up to a parent whose `memoizedProps` carries the row's profile data. This
-  is coupled to Juicebox's current React internals and returns an empty
-  string (rather than throwing) if their component structure changes.
+  It only exists on each row's underlying React data (`job_company_name`).
+  React keeps that on the DOM node as an expando (`__reactFiber$...`), and
+  expandos are not visible from the content script's isolated world, which
+  is why Company was empty in every export before v1.6.4. `main-world.js`
+  now reads the fiber and stamps the value on the row as `data-jb-company`
+  (attributes are shared between worlds) before each read. If that yields
+  nothing, the LinkedIn icon's people-search href (`keywords=<name>
+  <company>`) is used: the name tokens are stripped and the rest is
+  title-cased. Both are best-effort and return an empty string on failure.
 - If Juicebox stops loading before reaching the "Matches (N)" total shown at
   the top, the popup reports exactly how many candidates were actually
   collected rather than silently producing a short CSV.

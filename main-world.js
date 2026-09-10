@@ -44,6 +44,7 @@
 //   this script -> 'jbexport:resolved' {"requestId","url","method","clickedTag","anchorTarget"}
 //   this script -> 'jbexport:late'     {"rowId","url","method"}   (capture after the row's request timed out)
 //   this script -> 'jbexport:log'      {"line"}                     (diagnostic line for the debug file)
+//   content.js  -> 'jbexport:annotate' (no payload)                 (stamp data-jb-company on mounted rows)
 (() => {
   if (window.__jbExportMainWorldReady) return;
   window.__jbExportMainWorldReady = true;
@@ -359,6 +360,63 @@
       anchorTarget,
     };
   }
+
+  // ---- company annotation ----
+  // Company has no grid cell; it only exists on the row's React props. React
+  // stores those on the DOM node as an expando (__reactFiber$...), and
+  // expandos are NOT shared with the content script's isolated world, so the
+  // content script never saw them (Company was empty in every export). This
+  // world can read them and hands the value over as a DOM attribute, which
+  // both worlds share.
+  let annotateLogged = false;
+  const SKIP_KEYS = new Set(['_owner', 'return', 'stateNode', 'child', 'sibling', 'alternate', '_debugOwner']);
+  function fiberKeyOf(el) {
+    return (el && Object.keys(el).find((k) => k.startsWith('__reactFiber$'))) || null;
+  }
+  function deepFindCompany(obj, depth, seen) {
+    if (!obj || typeof obj !== 'object' || depth > 6 || seen.has(obj)) return '';
+    seen.add(obj);
+    if (typeof obj.job_company_name === 'string' && obj.job_company_name.trim()) return obj.job_company_name.trim();
+    if (obj.job_company && typeof obj.job_company.name === 'string' && obj.job_company.name.trim()) return obj.job_company.name.trim();
+    for (const k of Object.keys(obj)) {
+      if (SKIP_KEYS.has(k)) continue;
+      const v = obj[k];
+      if (v && typeof v === 'object') {
+        const f = deepFindCompany(v, depth + 1, seen);
+        if (f) return f;
+      }
+    }
+    return '';
+  }
+  function companyFromFiber(rowEl) {
+    const key = fiberKeyOf(rowEl);
+    if (!key) return '';
+    let fiber = rowEl[key];
+    for (let d = 0; fiber && d < 12; d += 1) {
+      if (fiber.memoizedProps) {
+        const f = deepFindCompany(fiber.memoizedProps, 0, new Set());
+        if (f) return f;
+      }
+      fiber = fiber.return;
+    }
+    return '';
+  }
+  document.addEventListener('jbexport:annotate', () => {
+    let set = 0, total = 0;
+    const rows = document.querySelectorAll('.MuiDataGrid-row[data-id]');
+    for (const row of rows) {
+      total += 1;
+      if (row.getAttribute('data-jb-company')) { set += 1; continue; }
+      let c = '';
+      try { c = companyFromFiber(row); } catch (err) { c = ''; }
+      row.setAttribute('data-jb-company', c);
+      if (c) set += 1;
+    }
+    if (!annotateLogged && total) {
+      annotateLogged = true;
+      log(`[LinkedIn Resolver] Company check: React fiber ${fiberKeyOf(rows[0]) ? 'reachable' : 'NOT reachable'} from page world, company found for ${set}/${total} mounted rows`);
+    }
+  });
 
   document.addEventListener('jbexport:session', (e) => {
     let req;

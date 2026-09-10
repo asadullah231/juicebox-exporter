@@ -311,7 +311,12 @@ function extractRow(rowEl) {
   const selected = isRowSelected(rowEl);
   logSelectionShape(rowEl);
 
-  const company = extractCompanyFromFiber(rowEl);
+  // Company: main-world.js's fiber read (data-jb-company) first, then the
+  // in-world fiber read (kept for completeness), then the search-keywords
+  // fallback.
+  const company = cleanText(rowEl.getAttribute('data-jb-company')) ||
+    extractCompanyFromFiber(rowEl) ||
+    companyFromSearchKeywords(name, domLinkedinUrl);
 
   return {
     id,
@@ -333,7 +338,31 @@ function extractRow(rowEl) {
 }
 
 function collectVisibleRows() {
+  // Synchronous round-trip: main-world.js stamps data-jb-company on every
+  // mounted row before the rows are read (see main-world.js).
+  document.dispatchEvent(new CustomEvent('jbexport:annotate'));
   return Array.from(document.querySelectorAll(ROW_SELECTOR)).map(extractRow);
+}
+
+// Last resort for Company: the LinkedIn icon's people-search href carries
+// "keywords=<name> <company>". Removing the candidate's name tokens from the
+// front leaves the company, lowercased by Juicebox, so it is title-cased.
+function companyFromSearchKeywords(name, searchUrl) {
+  const m = /[?&]keywords=([^&#]*)/i.exec(String(searchUrl || ''));
+  if (!m) return '';
+  let kw;
+  try { kw = decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch (e) { return ''; }
+  const fold = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const words = kw.trim().split(/\s+/);
+  const nameTokens = fold(name).split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < words.length && i < nameTokens.length && fold(words[i]) === nameTokens[i]) i += 1;
+  if (i === 0) return '';
+  const rest = words.slice(i).join(' ').trim();
+  if (!rest) return '';
+  // Capitalise the first letter of each word; \b would split on accented
+  // letters ("wörwag" -> "WöRwag"), so word starts are found explicitly.
+  return rest.replace(/(^|[\s(\-\/])(\p{L})/gu, (m, p, c) => p + c.toUpperCase());
 }
 
 function sleep(ms) {
