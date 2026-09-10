@@ -67,6 +67,9 @@
   // Learned from the first real click: the endpoint Juicebox calls for a
   // row, with the row id replaced by {id}. null until verified.
   let apiTemplate = null;
+  let apiHeaders = null;         // headers Juicebox itself sent with that request (auth lives here)
+  let apiDisabled = false;       // set after an auth/permission failure so no more time is wasted
+  let apiStats = { ok: 0, noProfile: 0, failed: 0, retried429: 0 };
   let apiSampleLogged = false;
   let clickQueue = Promise.resolve(); // click path is strictly one at a time
   let loggedMechanismOnce = false;
@@ -178,31 +181,70 @@
     const u = typeof input === 'string' ? input : (input && input.url) || '';
     if (fetchLog) fetchLog.push(`${(init && init.method) || 'GET'} ${u}`);
     // Learn the per-row endpoint from a real click: only accepted when the
-    // request carries exactly the row id we just clicked.
+    // request carries exactly the row id we just clicked. The request's own
+    // headers are kept too: SPAs usually authenticate with a bearer header,
+    // not a cookie, so replaying the URL alone would get a 401.
     if (!apiTemplate && sessionActive && inFlight && u) {
       const m = /[?&]searchResultId=([^&#]+)/.exec(u);
       if (m && decodeURIComponent(m[1]) === inFlight.rowId) {
         apiTemplate = u.replace(m[1], '{id}');
-        log(`[LinkedIn Resolver] API learned from click: ${apiTemplate}`);
+        apiHeaders = plainHeaders(input, init);
+        log(`[LinkedIn Resolver] API learned from click: ${apiTemplate} (headers: ${Object.keys(apiHeaders).join(', ') || 'none'})`);
       }
     }
     return originalFetch.apply(this, arguments);
   };
 
+  // Copies request headers into a plain object, from either a Request input
+  // or an init.headers (Headers instance, array, or object).
+  function plainHeaders(input, init) {
+    const out = {};
+    const add = (h) => {
+      if (!h) return;
+      if (typeof h.forEach === 'function' && !Array.isArray(h)) { h.forEach((v, k) => { out[k] = v; }); return; }
+      if (Array.isArray(h)) { for (const [k, v] of h) out[k] = v; return; }
+      if (typeof h === 'object') { for (const k of Object.keys(h)) out[k] = h[k]; }
+    };
+    if (input && typeof input === 'object' && input.headers) add(input.headers);
+    if (init && init.headers) add(init.headers);
+    for (const k of Object.keys(out)) {
+      if (/^(content-length|host|connection)$/i.test(k)) delete out[k];
+    }
+    return out;
+  }
+
   // Direct call of the learned endpoint. Returns null when the call could
   // not be trusted (network/HTTP error), so the caller falls back to a click.
   async function resolveViaApi(rowId) {
-    if (!apiTemplate) return null;
+    if (!apiTemplate || apiDisabled) return null;
     const url = apiTemplate.replace('{id}', encodeURIComponent(rowId));
     const startedAt = Date.now();
     let res;
-    try {
-      res = await originalFetch.call(window, url, { credentials: 'include' });
-    } catch (err) {
-      return null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        res = await originalFetch.call(window, url, { method: 'GET', headers: apiHeaders || {}, credentials: 'include' });
+      } catch (err) {
+        apiStats.failed += 1;
+        return null;
+      }
+      if (res.status === 429 && attempt === 0) {
+        // Rate limited: back off once, then try again before giving up.
+        apiStats.retried429 += 1;
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      break;
     }
     if (!res.ok) {
-      log(`[LinkedIn Resolver] API returned HTTP ${res.status} for a row; falling back to click`);
+      apiStats.failed += 1;
+      if (res.status === 401 || res.status === 403) {
+        // Auth is not replayable from here; stop trying so every row does
+        // not pay for a failed request before its click.
+        apiDisabled = true;
+        log(`[LinkedIn Resolver] API returned HTTP ${res.status}; direct calls disabled for this session, using clicks`);
+      } else if (apiStats.failed <= 3) {
+        log(`[LinkedIn Resolver] API returned HTTP ${res.status} for a row; falling back to click`);
+      }
       return null;
     }
     const text = await res.text();
@@ -212,6 +254,7 @@
     }
     const m = /https?:\\?\/\\?\/(?:[a-z]{2,3}\.)?linkedin\.com\\?\/in\\?\/[^"'\s<>\\]+/i.exec(text);
     const found = m ? m[0].replace(/\\\//g, '/') : '';
+    if (found) apiStats.ok += 1; else apiStats.noProfile += 1;
     return {
       url: found,
       method: found ? 'api' : 'api-no-profile',
@@ -317,7 +360,10 @@
     let req;
     try { req = JSON.parse(e.detail); } catch (err) { return; }
     sessionActive = !!req.active;
-    if (!sessionActive) { inFlight = null; lastClicked = null; pending = []; }
+    if (!sessionActive) {
+      inFlight = null; lastClicked = null; pending = [];
+      log(`[LinkedIn Resolver] Session summary: api template ${apiTemplate ? 'learned' : 'NOT learned'}${apiDisabled ? ' (disabled after auth error)' : ''}, api ok=${apiStats.ok} noProfile=${apiStats.noProfile} failed=${apiStats.failed} retried429=${apiStats.retried429}`);
+    }
   });
 
   document.addEventListener('jbexport:resolve', async (e) => {

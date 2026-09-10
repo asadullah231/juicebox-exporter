@@ -351,6 +351,7 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
         : '';
       const diagLine =
         `LinkedIn profiles: ${resolved}/${d.attempted} resolved` +
+        (d.viaApi ? ` (${d.viaApi} via API)` : '') +
         (d.late ? ` (${d.late} arrived late)` : '') +
         (d.cached ? ` + ${d.cached} from cache` : '') +
         (d.retryRecovered ? `, ${d.retryRecovered} recovered on retry` : '') +
@@ -358,7 +359,8 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
         (d.skippedNotMounted ? `, ${d.skippedNotMounted} not mounted at first sight` : '') +
         (s.method ? ` (via ${s.method})` : '') + '.';
       setTimeout(() => setStatus(`${statusEl.textContent} ${diagLine}`, d.none === 0 ? 'success' : 'error'), 0);
-      if (d.none > 0) setTimeout(() => downloadDebugLog(response.debugLog), 400);
+      // Always saved for now: the speed/selection reports need it.
+      setTimeout(() => downloadDebugLog(response.debugLog), 400);
     }
 
     if (mergedCount > 0) {

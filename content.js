@@ -248,17 +248,41 @@ async function resolveLinkedInUrlDetailed(rowEl) {
 // in some builds, inside the first data cell). Any of these counts, and any
 // checkbox inside the row that is NOT checked is ignored, so a row is only
 // "selected" when the grid itself says so.
+// Every way a MUI DataGrid / MUI Checkbox / custom checkbox can show "checked".
+// Juicebox's grid does not necessarily use MUI's own selection model, so the
+// row-level markers alone are not enough: the checkbox cell itself is read too.
 function isRowSelected(rowEl) {
   if (rowEl.getAttribute('aria-selected') === 'true') return true;
   if (rowEl.classList.contains('Mui-selected')) return true;
-  const boxes = rowEl.querySelectorAll(
-    '[data-field="__check__"] input[type="checkbox"], [data-field="full_name"] input[type="checkbox"], input[type="checkbox"]'
-  );
-  for (const box of boxes) {
-    if (box.checked) return true;
+  for (const box of rowEl.querySelectorAll('input[type="checkbox"]')) {
+    if (box.checked || box.getAttribute('aria-checked') === 'true') return true;
   }
-  const aria = rowEl.querySelector('[role="checkbox"][aria-checked="true"]');
-  return !!aria;
+  if (rowEl.querySelector('[role="checkbox"][aria-checked="true"], [aria-checked="true"]')) return true;
+  if (rowEl.querySelector('.Mui-checked, .MuiCheckbox-root.Mui-checked, [data-checked="true"], [data-state="checked"]')) return true;
+  // MUI Checkbox renders a different SVG icon when checked.
+  if (rowEl.querySelector('svg[data-testid="CheckBoxIcon"], svg[data-testid="IndeterminateCheckBoxIcon"]')) return true;
+  return false;
+}
+
+// One-time description of what a row's checkbox cell looks like, so a
+// selection that the detector misses can be diagnosed from the debug file.
+// Only tag names, classes and attributes are logged, never cell text.
+let selectionShapeLogged = false;
+function logSelectionShape(rowEl) {
+  if (selectionShapeLogged) return;
+  selectionShapeLogged = true;
+  const cell = rowEl.querySelector('[data-field="__check__"]') ||
+    rowEl.querySelector('input[type="checkbox"], [role="checkbox"]')?.closest('[role="cell"], [data-field]') ||
+    rowEl.firstElementChild;
+  const describe = (el, depth) => {
+    if (!el || depth > 4) return '';
+    const attrs = Array.from(el.attributes || [])
+      .filter((a) => /^(class|role|aria-|data-|type|checked)/.test(a.name))
+      .map((a) => `${a.name}="${String(a.value).slice(0, 60)}"`).join(' ');
+    const kids = Array.from(el.children || []).slice(0, 4).map((k) => describe(k, depth + 1)).join('');
+    return `<${el.tagName.toLowerCase()}${attrs ? ' ' + attrs : ''}>${kids}</${el.tagName.toLowerCase()}>`;
+  };
+  debug(`[LinkedIn Resolver] Selection check: row aria-selected="${rowEl.getAttribute('aria-selected')}" class="${rowEl.className}" | check cell: ${describe(cell, 0).slice(0, 900)}`);
 }
 
 function extractRow(rowEl) {
@@ -285,6 +309,7 @@ function extractRow(rowEl) {
   const matchPercent = cleanText(matchEl?.textContent);
 
   const selected = isRowSelected(rowEl);
+  logSelectionShape(rowEl);
 
   const company = extractCompanyFromFiber(rowEl);
 
@@ -359,6 +384,7 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
   const byKey = new Map();
   liveRowsById = new Map();
   debugLog.length = 0;
+  selectionShapeLogged = false;
   debugLog.push(`[LinkedIn Resolver] Run started ${new Date().toISOString()} | onlySelected=${!!onlySelected} | ${location.href}`);
 
   // The element for a row *right now*. A snapshot taken by collectVisibleRows()
@@ -426,6 +452,13 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
 
       const existing = byKey.get(row.key);
       if (existing) {
+        // A row first seen unselected can show up selected later (the grid
+        // re-renders the checkbox after its state settles). Pick it up and
+        // resolve it now instead of leaving it out of the selected export.
+        if (onlySelected && row.selected && !existing.selected) {
+          existing.selected = true;
+          if (!existing.linkedinUrl) { existing.needsResolve = true; existing.attempts = 0; }
+        }
         if (existing.needsResolve && existing.attempts < MAX_RESOLVE_ATTEMPTS && liveRowEl(row)) {
           jobs.push({ target: existing, id: row.id, rowEl: row.rowEl, retry: true });
         }
