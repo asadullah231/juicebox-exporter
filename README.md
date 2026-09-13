@@ -19,7 +19,7 @@ candidate profile pages are opened.
 3. Click **Export CSV** (or **Export Selected** if you've checked specific rows)
 4. Wait while it scrolls through the results — progress updates show the
    running count
-5. The CSV downloads automatically as `juicebox-candidates-YYYY-MM-DD.csv`
+5. The CSV downloads automatically as `<project name> - <list> - YYYY-MM-DD.csv`, e.g. `Product Marketing Manager - Advanced Energy - Shortlist - 2026-09-13.csv` (project and list read from the page breadcrumb)
 
 ## How it works
 

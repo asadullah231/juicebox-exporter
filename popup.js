@@ -172,10 +172,21 @@ function todayStamp() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-function downloadCsv(csvText) {
+// "<project> - <list> - YYYY-MM-DD.csv", with characters Windows/macOS do not
+// allow in file names replaced.
+function exportFileName(title) {
+  const safe = String(title || 'juicebox-candidates')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  return `${safe} - ${todayStamp()}.csv`;
+}
+
+function downloadCsv(csvText, title) {
   const blob = new Blob(['﻿' + csvText], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
-  const filename = `juicebox-candidates-${todayStamp()}.csv`;
+  const filename = exportFileName(title);
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
@@ -348,7 +359,7 @@ async function runExtraction(onlySelected, useCachedIfAvailable) {
     }
 
     setStatus('Exporting CSV…');
-    downloadCsv(buildCsv(finalCandidates));
+    downloadCsv(buildCsv(finalCandidates), response.exportTitle);
 
     // Surface what the click-resolve step actually did, so a CSV full of
     // search links can be diagnosed from the popup instead of guessed at.

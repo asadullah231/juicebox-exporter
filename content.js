@@ -921,7 +921,45 @@ let activeExtraction = null;
 // completion) can still retrieve the finished result instead of losing it.
 let lastResult = null;
 
-function buildExportPayload(rows, onlySelected, expectedTotal) {
+// Name for the exported file: the project name from the breadcrumb plus the
+// list being exported, e.g. "Product Marketing Manager - Advanced Energy -
+// Shortlist". Read from the breadcrumb ("Projects > <project> > Shortlist
+// (571)"); falls back to the document title.
+function getExportTitle() {
+  const LIST_RE = /^(Shortlist|Intake|Matches|Results|Search)\s*(?:\(\s*\d+\s*\))?$/i;
+  let label = null;
+  for (const el of document.querySelectorAll('nav *, a, span, p, div, h1, h2, h3')) {
+    if (el.children.length > 2) continue;
+    const t = cleanText(el.textContent);
+    if (t.length > 40) continue;
+    if (LIST_RE.test(t)) { label = el; break; }
+  }
+  let project = '';
+  let listName = '';
+  if (label) {
+    listName = cleanText(label.textContent).replace(/\s*\(.*$/, '');
+    let container = label.parentElement;
+    for (let i = 0; container && i < 5; i += 1) {
+      const leaves = Array.from(container.querySelectorAll('*'))
+        .filter((n) => n.children.length === 0 && cleanText(n.textContent).length > 0)
+        .map((n) => cleanText(n.textContent))
+        .filter((t) => !/^[>›»\/|]$/.test(t));
+      const idx = leaves.findIndex((t) => LIST_RE.test(t));
+      if (idx > 0) {
+        const prev = leaves.slice(0, idx).filter((t) => !/^projects?$/i.test(t));
+        if (prev.length) { project = prev[prev.length - 1]; break; }
+      }
+      container = container.parentElement;
+    }
+  }
+  if (!project) {
+    project = cleanText(document.title).replace(/\s*[|\-–]\s*Juicebox.*$/i, '');
+  }
+  const parts = [project, listName].filter(Boolean);
+  return parts.join(' - ') || 'juicebox-candidates';
+}
+
+function buildExportPayload(rows, onlySelected, expectedTotal, exportTitle) {
   const filtered = onlySelected ? rows.filter((r) => r.selected) : rows;
   const candidates = filtered.map((r) => ({
     name: r.name,
@@ -939,6 +977,7 @@ function buildExportPayload(rows, onlySelected, expectedTotal) {
     selectedCount: rows.filter((r) => r.selected).length,
     onlySelected: !!onlySelected,
     expectedTotal,
+    exportTitle: exportTitle || getExportTitle(),
     incomplete: expectedTotal != null && rows.length < expectedTotal,
     resolveDiag: { ...resolveDiag },
     debugLog: debugLog.slice(),
@@ -964,7 +1003,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // A popup re-attaching after a reopen doesn't know which button started
       // the run; fall back to what the run was started with.
       const onlySelected = message.onlySelected == null ? !!lastResult.onlySelected : !!message.onlySelected;
-      sendResponse(buildExportPayload(lastResult.rows, onlySelected, lastResult.expectedTotal));
+      sendResponse(buildExportPayload(lastResult.rows, onlySelected, lastResult.expectedTotal, lastResult.exportTitle));
     }
     return true;
   }
@@ -1000,8 +1039,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           onlySelected
         );
 
-        lastResult = { rows, expectedTotal, onlySelected };
-        sendResponse(buildExportPayload(rows, onlySelected, expectedTotal));
+        const exportTitle = getExportTitle();
+        lastResult = { rows, expectedTotal, onlySelected, exportTitle };
+        sendResponse(buildExportPayload(rows, onlySelected, expectedTotal, exportTitle));
       } catch (err) {
         sendResponse({ ok: false, error: err.message || 'UNKNOWN_ERROR' });
       } finally {
