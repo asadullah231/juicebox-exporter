@@ -68,6 +68,8 @@
   // Learned from the first real click: the endpoint Juicebox calls for a
   // row, with the row id replaced by {id}. null until verified.
   let apiTemplate = null;
+  let apiIdKey = null;           // '@data-id', '@row', or a React prop key holding the row's id
+  const SKIP_KEYS = new Set(['_owner', 'return', 'stateNode', 'child', 'sibling', 'alternate', '_debugOwner']);
   let apiHeaders = null;         // headers Juicebox itself sent with that request (auth lives here)
   let apiDisabled = false;       // set after an auth/permission failure so no more time is wasted
   let apiStats = { ok: 0, noProfile: 0, failed: 0, retried429: 0 };
@@ -188,15 +190,28 @@
     // The row id may travel under any parameter name (searchResultId on a
     // search, something else on a Shortlist or Intake list), so the id
     // itself is matched anywhere in an /api/ URL.
+    // The id the endpoint wants may be the row's data-id (search results)
+    // or some id that only exists in the row's React props (Shortlist rows
+    // have no data-id at all). Every candidate id of the clicked row is
+    // tried against the URL; the matching key is remembered so the same
+    // field can be read from every other row.
     if (!apiTemplate && sessionActive && inFlight && u && inFlight.rowId) {
-      const rid = String(inFlight.rowId);
-      const enc = encodeURIComponent(rid);
-      const hit = u.includes(enc) ? enc : (u.includes(rid) ? rid : null);
       const path = u.replace(/^https?:\/\/[^/]+/, '');
-      if (hit && /^\/?api\//.test(path)) {
-        apiTemplate = u.split(hit).join('{id}');
+      const rowEl = findRow(inFlight.rowId);
+      const candidates = rowIdCandidates(rowEl, String(inFlight.rowId));
+      let hit = null;
+      if (/^\/?api\//.test(path)) {
+        for (const c of candidates) {
+          const enc = encodeURIComponent(c.value);
+          const needle = u.includes(enc) ? enc : (u.includes(c.value) ? c.value : null);
+          if (needle) { hit = { key: c.key, needle }; break; }
+        }
+      }
+      if (hit) {
+        apiTemplate = u.split(hit.needle).join('{id}');
+        apiIdKey = hit.key;
         apiHeaders = plainHeaders(input, init);
-        log(`[LinkedIn Resolver] API learned from click: ${apiTemplate} (headers: ${Object.keys(apiHeaders).join(', ') || 'none'})`);
+        log(`[LinkedIn Resolver] API learned from click: ${apiTemplate} (id from ${apiIdKey}; headers: ${Object.keys(apiHeaders).join(', ') || 'none'})`);
       }
     }
     return originalFetch.apply(this, arguments);
@@ -220,11 +235,50 @@
     return out;
   }
 
+  // Id-looking strings in a row's React props: {key, value} pairs, depth
+  // limited, fiber links skipped. Used to learn which prop the endpoint's
+  // id comes from and to read it back from other rows.
+  const ID_VALUE_RE = /^[A-Za-z0-9_-]{8,}$/;
+  function collectIdStrings(obj, depth, seen, out) {
+    if (!obj || typeof obj !== 'object' || depth > 5 || seen.has(obj) || out.length > 300) return;
+    seen.add(obj);
+    for (const k of Object.keys(obj)) {
+      if (SKIP_KEYS.has(k)) continue;
+      const v = obj[k];
+      if (typeof v === 'string') { if (ID_VALUE_RE.test(v)) out.push({ key: k, value: v }); }
+      else if (typeof v === 'number' && Number.isInteger(v) && v > 999) out.push({ key: k, value: String(v) });
+      else if (v && typeof v === 'object') collectIdStrings(v, depth + 1, seen, out);
+    }
+  }
+  function rowIdCandidates(rowEl, rowId) {
+    const out = [];
+    if (rowEl && rowEl.getAttribute('data-id')) out.push({ key: '@data-id', value: rowEl.getAttribute('data-id') });
+    if (rowId && !rowId.startsWith('t:')) out.push({ key: '@row', value: rowId });
+    const key = rowEl && fiberKeyOf(rowEl);
+    if (key) {
+      let fiber = rowEl[key];
+      for (let d = 0; fiber && d < 12 && out.length < 300; d += 1) {
+        if (fiber.memoizedProps) collectIdStrings(fiber.memoizedProps, 0, new Set(), out);
+        fiber = fiber.return;
+      }
+    }
+    return out;
+  }
+  function rowApiId(rowEl, rowId) {
+    if (!apiIdKey) return '';
+    if (apiIdKey === '@data-id') return (rowEl && rowEl.getAttribute('data-id')) || '';
+    if (apiIdKey === '@row') return rowId || '';
+    const c = rowIdCandidates(rowEl, rowId).find((x) => x.key === apiIdKey);
+    return c ? c.value : '';
+  }
+
   // Direct call of the learned endpoint. Returns null when the call could
   // not be trusted (network/HTTP error), so the caller falls back to a click.
   async function resolveViaApi(rowId) {
     if (!apiTemplate || apiDisabled) return null;
-    const url = apiTemplate.replace('{id}', encodeURIComponent(rowId));
+    const idValue = rowApiId(findRow(rowId), rowId);
+    if (!idValue) return null;
+    const url = apiTemplate.replace('{id}', encodeURIComponent(idValue));
     const startedAt = Date.now();
     let res;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -290,13 +344,21 @@
     });
   }
 
+  function findRow(rowId) {
+    const esc = CSS.escape(String(rowId));
+    return document.querySelector(`.MuiDataGrid-row[data-id="${esc}"], [data-id="${esc}"], [data-jb-row="${esc}"]`);
+  }
+
   async function resolveRow(rowId, requestId, name) {
-    const row = document.querySelector(`.MuiDataGrid-row[data-id="${CSS.escape(rowId)}"]`);
+    const row = findRow(rowId);
     if (!row) return { url: '', method: 'row-not-mounted', clickedTag: '', anchorTarget: '' };
 
-    const cell = row.querySelector('[data-field="profiles"]');
-    const icon = cell && cell.querySelector('img[src*="linkedin" i]');
-    const anchor = cell && cell.querySelector('a[aria-label="LinkedIn"]');
+    // Grid rows keep the icons in a "profiles" cell; table rows (Shortlist)
+    // have no data-field, so the whole row is searched.
+    const cell = row.querySelector('[data-field="profiles"]') || row;
+    const anchor = cell.querySelector('a[aria-label="LinkedIn"], a[href*="linkedin.com"]');
+    const icon = cell.querySelector('img[src*="linkedin" i], svg[data-testid*="linkedin" i], [aria-label*="linkedin" i] svg, [class*="linkedin" i]') ||
+      (anchor && (anchor.querySelector('img, svg') || anchor));
     // The React handler is bound on the icon's wrapper, not necessarily on
     // the <a>; clicking the wrapper is what a real user click dispatches
     // through. Confirmed against a manual console test on the live page.
@@ -375,7 +437,6 @@
   // world can read them and hands the value over as a DOM attribute, which
   // both worlds share.
   let annotateLogged = false;
-  const SKIP_KEYS = new Set(['_owner', 'return', 'stateNode', 'child', 'sibling', 'alternate', '_debugOwner']);
   function fiberKeyOf(el) {
     return (el && Object.keys(el).find((k) => k.startsWith('__reactFiber$'))) || null;
   }
@@ -409,7 +470,7 @@
   }
   document.addEventListener('jbexport:annotate', () => {
     let set = 0, total = 0;
-    const rows = document.querySelectorAll('.MuiDataGrid-row[data-id]');
+    const rows = document.querySelectorAll('.MuiDataGrid-row[data-id], [data-jb-row], table tbody tr');
     for (const row of rows) {
       total += 1;
       if (row.getAttribute('data-jb-company')) { set += 1; continue; }

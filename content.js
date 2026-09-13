@@ -33,7 +33,8 @@ function pageDiag() {
   return {
     grid: !!document.querySelector(GRID_SELECTOR),
     scroller: !!findScroller(),
-    rows: document.querySelectorAll(ROW_SELECTOR).length,
+    rows: document.querySelectorAll(ROW_SELECTOR).length + document.querySelectorAll(TABLE_ROW_SELECTOR).length,
+    mode: isTableMode() ? 'table' : 'grid',
     rowsWithId: document.querySelectorAll('[role="row"][data-id], .MuiDataGrid-row[data-id]').length,
     nameCells: document.querySelectorAll('[data-field="full_name"], [data-field="name"], [data-field="fullName"]').length,
     path: location.pathname,
@@ -43,6 +44,155 @@ function pageDiag() {
 function cleanText(value) {
   if (!value) return '';
   return value.replace(/\s+/g, ' ').trim();
+}
+
+// ---------------------------------------------------------------------------
+// Table mode (project Shortlist / Intake lists)
+//
+// Those pages are not a MUI DataGrid: they render a plain <table> in pages
+// of ~40 rows with a pager underneath ("1-40 of 571"). Rows carry no
+// data-id, so a stable key (name + title) is stamped on each <tr> as
+// data-jb-row; main-world.js finds rows by that attribute the same way it
+// finds grid rows by data-id. Columns are mapped from the header text.
+// ---------------------------------------------------------------------------
+const TABLE_ROW_SELECTOR = 'table tbody tr';
+
+function isTableMode() {
+  return !document.querySelector('.MuiDataGrid-root, .MuiDataGrid-virtualScroller') &&
+    document.querySelectorAll(TABLE_ROW_SELECTOR).length > 0;
+}
+
+function tableColumnMap() {
+  const ths = Array.from(document.querySelectorAll('table thead th, table thead td, table [role="columnheader"]'));
+  const map = {};
+  ths.forEach((th, i) => {
+    const t = cleanText(th.textContent).toLowerCase();
+    if (!t) return;
+    if (map.name == null && /full name|^name$|candidate/.test(t)) map.name = i;
+    else if (map.title == null && /title|headline|position|^role$/.test(t)) map.title = i;
+    else if (map.company == null && /company|employer|organi[sz]ation/.test(t)) map.company = i;
+    else if (map.location == null && /location|city|country/.test(t)) map.location = i;
+    else if (map.match == null && /match/.test(t)) map.match = i;
+  });
+  return map;
+}
+
+function stableRowKey(name, title) {
+  return 't:' + (name + '|' + title).toLowerCase().replace(/\s+/g, ' ').slice(0, 140);
+}
+
+function extractTableRow(tr, cols) {
+  const cells = Array.from(tr.children);
+  const cellText = (i) => (i == null || !cells[i]) ? '' : cleanText(cells[i].textContent);
+  const nameCell = cols.name != null ? cells[cols.name] : (cells[1] || cells[0]);
+  // Icons in the name cell are SVGs with no text, so the cell text is the name.
+  const name = cleanText(nameCell ? nameCell.textContent : '');
+  const jobTitle = cellText(cols.title);
+  const location = cellText(cols.location);
+  const matchPercent = cellText(cols.match);
+
+  const linkedinEl = tr.querySelector('a[aria-label="LinkedIn"], a[href*="linkedin.com"]');
+  const domLinkedinUrl = linkedinEl?.getAttribute('href') || '';
+  const linkedinUrl = canonicalLinkedInProfileUrl(domLinkedinUrl);
+
+  const id = tr.getAttribute('data-id') || (name ? stableRowKey(name, jobTitle) : null);
+  if (id) tr.setAttribute('data-jb-row', id);
+
+  const selected = isRowSelected(tr);
+  logSelectionShape(tr);
+
+  const company = cellText(cols.company) ||
+    cleanText(tr.getAttribute('data-jb-company')) ||
+    companyFromSearchKeywords(name, domLinkedinUrl);
+
+  return {
+    id,
+    key: id || `${name}|${jobTitle}|${location}`,
+    name,
+    linkedinUrl,
+    domLinkedinUrl,
+    rowEl: tr,
+    jobTitle,
+    location,
+    matchPercent,
+    company,
+    selected,
+    hasAnyField: !!(name || domLinkedinUrl || jobTitle),
+  };
+}
+
+// Pager controls. MUI Pagination uses aria-labels ("Go to next page",
+// "Go to page 1"); custom pagers usually still label or title the arrows.
+function findPagerButton(kind) {
+  const labels = kind === 'next'
+    ? ['button[aria-label*="next" i]', 'a[aria-label*="next" i]', 'button[title*="next" i]', '[data-testid*="next" i]']
+    : ['button[aria-label="Go to page 1"]', 'button[aria-label*="first" i]', 'button[title*="first" i]'];
+  for (const sel of labels) {
+    const el = document.querySelector(sel);
+    if (el) return el;
+  }
+  const textRe = kind === 'next' ? /^(next|›|>|»|→)$/i : /^(1|«|first)$/i;
+  return Array.from(document.querySelectorAll('button, a[role="button"]'))
+    .find((b) => textRe.test(cleanText(b.textContent))) || null;
+}
+
+function isDisabled(btn) {
+  return !btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true' || btn.classList.contains('Mui-disabled');
+}
+
+function pageSignature() {
+  return Array.from(document.querySelectorAll(TABLE_ROW_SELECTOR)).slice(0, 3)
+    .map((tr) => cleanText(tr.textContent)).join('|');
+}
+
+function waitUntil(check, timeoutMs, intervalMs) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const tick = () => {
+      let v = false;
+      try { v = check(); } catch (e) { v = false; }
+      if (v) return resolve(true);
+      if (Date.now() - started >= timeoutMs) return resolve(false);
+      setTimeout(tick, intervalMs);
+    };
+    tick();
+  });
+}
+
+// Walks the pager from page 1 to the last page, reading every page. Rows
+// are resolved while their page is showing (the same "row must be mounted"
+// rule as the grid). Stops when the next button is disabled/missing or a
+// click no longer changes the page.
+async function paginateAndCollect(byKey, addRows, onProgress, shouldAbort, options) {
+  const stopWhen = options && typeof options.stopWhen === 'function' ? options.stopWhen : null;
+  const MAX_PAGES = 1000;
+
+  const first = findPagerButton('first');
+  if (first && !isDisabled(first)) {
+    const sig = pageSignature();
+    first.click();
+    await waitUntil(() => pageSignature() !== sig, 5000, 100);
+  }
+
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    if (shouldAbort()) throw new Error('ABORTED');
+    await sleep(150);
+    await addRows(collectVisibleRows());
+    await sleep(100);
+    await addRows(collectVisibleRows());
+    onProgress(byKey.size, false);
+    if (stopWhen && stopWhen()) break;
+
+    const next = findPagerButton('next');
+    if (isDisabled(next)) break;
+    const sig = pageSignature();
+    next.click();
+    const changed = await waitUntil(() => pageSignature() !== sig, 8000, 100);
+    if (!changed) break;
+  }
+
+  onProgress(byKey.size, true);
+  return Array.from(byKey.values());
 }
 
 // The Company name isn't rendered in any grid cell — it only exists on the
@@ -91,7 +241,9 @@ function extractCompanyFromFiber(rowEl) {
 }
 
 function isJuiceboxResultsPage() {
-  return !!document.querySelector(GRID_SELECTOR) || document.querySelectorAll(ROW_SELECTOR).length > 0;
+  return !!document.querySelector(GRID_SELECTOR) ||
+    document.querySelectorAll(ROW_SELECTOR).length > 0 ||
+    document.querySelectorAll(TABLE_ROW_SELECTOR).length > 0;
 }
 
 function getExpectedTotal() {
@@ -104,6 +256,14 @@ function getExpectedTotal() {
     if (t.length > 60) continue;
     const match = t.match(RE);
     if (match) return parseInt(match[1], 10);
+  }
+  // Pager text "1-40 of 571"
+  for (const el of document.querySelectorAll('p, span, div')) {
+    if (el.children.length > 2) continue;
+    const t = (el.textContent || '').trim();
+    if (t.length > 40) continue;
+    const m = t.match(/\b\d+\s*[-\u2013]\s*\d+\s+of\s+(\d+)\b/i);
+    if (m) return parseInt(m[1], 10);
   }
   const grid = document.querySelector(GRID_SELECTOR);
   const ariaCount = grid?.getAttribute('aria-rowcount');
@@ -379,6 +539,10 @@ function collectVisibleRows() {
   // Synchronous round-trip: main-world.js stamps data-jb-company on every
   // mounted row before the rows are read (see main-world.js).
   document.dispatchEvent(new CustomEvent('jbexport:annotate'));
+  if (isTableMode()) {
+    const cols = tableColumnMap();
+    return Array.from(document.querySelectorAll(TABLE_ROW_SELECTOR)).map((tr) => extractTableRow(tr, cols));
+  }
   return Array.from(document.querySelectorAll(ROW_SELECTOR)).map(extractRow);
 }
 
@@ -436,8 +600,9 @@ function setResolverSession(active) {
 }
 
 async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
-  const scroller = findScroller();
-  if (!scroller) {
+  const tableMode = isTableMode();
+  const scroller = tableMode ? null : findScroller();
+  if (!tableMode && !scroller) {
     throw new Error('SCROLLER_NOT_FOUND');
   }
 
@@ -452,7 +617,7 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
   liveRowsById = new Map();
   debugLog.length = 0;
   selectionShapeLogged = false;
-  debugLog.push(`[LinkedIn Resolver] Run started ${new Date().toISOString()} | onlySelected=${!!onlySelected} | ${location.href}`);
+  debugLog.push(`[LinkedIn Resolver] Run started ${new Date().toISOString()} | mode=${tableMode ? 'table' : 'grid'} | onlySelected=${!!onlySelected} | ${location.href}`);
 
   // The element for a row *right now*. A snapshot taken by collectVisibleRows()
   // goes stale within a pass: each click takes up to a few seconds and
@@ -461,7 +626,8 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
   // comes. That was the real cause of whole runs of consecutive empty rows.
   const liveRowEl = (row) => {
     if (row.id) {
-      const el = document.querySelector(ROW_SELECTOR + '[data-id="' + CSS.escape(String(row.id)) + '"]');
+      const esc = CSS.escape(String(row.id));
+      const el = document.querySelector(`[data-id="${esc}"], [data-jb-row="${esc}"]`);
       if (el) return el;
     }
     return row.rowEl && row.rowEl.isConnected ? row.rowEl : null;
@@ -553,13 +719,16 @@ async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
 
   setResolverSession(true);
   try {
-    const rows = await scrollAndCollect(scroller, byKey, addRows, onProgress, shouldAbort);
+    const walk = tableMode
+      ? (b, add, prog, abort, opts) => paginateAndCollect(b, add, prog, abort, opts)
+      : (b, add, prog, abort, opts) => scrollAndCollect(scroller, b, add, prog, abort, opts);
+    const rows = await walk(byKey, addRows, onProgress, shouldAbort);
     // Second pass over the list for rows that missed the first time. Only
     // those rows are clicked; everything else is skipped on sight.
     if (pendingRetries() > 0 && !shouldAbort()) {
       debug('[LinkedIn Resolver] Retry pass for ' + pendingRetries() + ' unresolved row(s)');
-      await scrollAndCollect(
-        scroller, byKey,
+      await walk(
+        byKey,
         (visible) => addRows(visible, { retryOnly: true }),
         onProgress, shouldAbort,
         { stopWhen: () => pendingRetries() === 0 }

@@ -30,6 +30,17 @@ candidate profile pages are opened.
   "Merge with a previous export" keep their own First/Last Name columns if
   present, otherwise they are split the same way.
 
+- **Two page types.** A search results page is a MUI DataGrid that scrolls
+  (virtualised rows). A project **Shortlist** or **Intake** list is a plain
+  HTML table shown in pages of ~40 rows with a pager ("1-40 of 571"). The
+  extension detects which one it is on: grid mode scrolls, table mode
+  walks the pager from page 1 to the last page and reads every page. Table
+  rows have no `data-id`, so a stable key (name + title) is stamped on each
+  row as `data-jb-row` and used for caching, retries and the click resolver.
+  Columns are mapped from the header text (Full Name, title, company,
+  location). The endpoint learned from the first click is matched against
+  every id-looking value in the clicked row's React props, so the fast path
+  works even when the row id lives under a different parameter name.
 - The results table is a Material-UI X DataGrid. Rows are read via stable
   `data-field` attributes (`full_name`, `profiles`, `job_title_info`,
   `location_info`, `matchRate`), not auto-generated CSS class hashes.
