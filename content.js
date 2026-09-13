@@ -121,9 +121,52 @@ function extractTableRow(tr, cols) {
   };
 }
 
-// Pager controls. MUI Pagination uses aria-labels ("Go to next page",
-// "Go to page 1"); custom pagers usually still label or title the arrows.
+// Pager. Juicebox's list pager is "41–80 of 571  ‹ 1 [2] 3 4 ›": the arrows
+// are icons with no text or label, so the pager is driven from the range
+// text and the numbered page buttons instead, with labelled arrows as a
+// fallback for other layouts.
+function readPagerRange() {
+  for (const el of document.querySelectorAll('p, span, div, td')) {
+    if (el.children.length > 2) continue;
+    const t = (el.textContent || '').trim();
+    if (t.length > 40) continue;
+    const m = t.match(/^(\d+)\s*[-–—]\s*(\d+)\s+of\s+(\d+)$/i);
+    if (m) return { el, start: +m[1], end: +m[2], total: +m[3] };
+  }
+  return null;
+}
+
+function pagerButtons(rangeEl) {
+  // The pager container: nearest ancestor of the range text holding the
+  // numbered page buttons.
+  let el = rangeEl;
+  for (let i = 0; el && i < 6; i += 1) {
+    const btns = Array.from(el.querySelectorAll('button, [role="button"], a'));
+    if (btns.some((b) => /^\d+$/.test(cleanText(b.textContent)))) return btns;
+    el = el.parentElement;
+  }
+  return [];
+}
+
 function findPagerButton(kind) {
+  const range = readPagerRange();
+  if (range) {
+    const pageSize = Math.max(1, range.end - range.start + 1);
+    const current = Math.floor((range.start - 1) / Math.max(1, pageSize)) + 1;
+    const btns = pagerButtons(range.el);
+    const byNumber = (n) => btns.find((b) => cleanText(b.textContent) === String(n)) || null;
+    if (kind === 'first') {
+      if (range.start === 1) return null;
+      return byNumber(1) || btns[0] || null;
+    }
+    if (range.end >= range.total) return null; // last page
+    const numbered = byNumber(current + 1);
+    if (numbered) return numbered;
+    // No visible button for the next number: the arrow after the last
+    // numbered button (icon-only, so found by position).
+    const lastNumIdx = btns.map((b) => /^\d+$/.test(cleanText(b.textContent))).lastIndexOf(true);
+    if (lastNumIdx >= 0 && btns[lastNumIdx + 1]) return btns[lastNumIdx + 1];
+  }
   const labels = kind === 'next'
     ? ['button[aria-label*="next" i]', 'a[aria-label*="next" i]', 'button[title*="next" i]', '[data-testid*="next" i]']
     : ['button[aria-label="Go to page 1"]', 'button[aria-label*="first" i]', 'button[title*="first" i]'];
@@ -134,6 +177,20 @@ function findPagerButton(kind) {
   const textRe = kind === 'next' ? /^(next|›|>|»|→)$/i : /^(1|«|first)$/i;
   return Array.from(document.querySelectorAll('button, a[role="button"]'))
     .find((b) => textRe.test(cleanText(b.textContent))) || null;
+}
+
+// True once the table has settled after a page change: the row count has
+// stayed the same across two consecutive reads.
+async function waitForTableSettled(maxMs) {
+  const started = Date.now();
+  let last = -1;
+  while (Date.now() - started < maxMs) {
+    const n = document.querySelectorAll(TABLE_ROW_SELECTOR).length;
+    if (n > 0 && n === last) return true;
+    last = n;
+    await sleep(200);
+  }
+  return false;
 }
 
 function isDisabled(btn) {
@@ -172,6 +229,7 @@ async function paginateAndCollect(byKey, addRows, onProgress, shouldAbort, optio
     const sig = pageSignature();
     first.click();
     await waitUntil(() => pageSignature() !== sig, 5000, 100);
+    await waitForTableSettled(3000);
   }
 
   for (let page = 0; page < MAX_PAGES; page += 1) {
@@ -183,12 +241,19 @@ async function paginateAndCollect(byKey, addRows, onProgress, shouldAbort, optio
     onProgress(byKey.size, false);
     if (stopWhen && stopWhen()) break;
 
+    const range = readPagerRange();
     const next = findPagerButton('next');
+    debug(`[LinkedIn Resolver] Pager: ${range ? `${range.start}-${range.end} of ${range.total}` : 'no range text'}, next button ${next ? `<${next.tagName.toLowerCase()} "${cleanText(next.textContent).slice(0, 12)}">` : 'not found'}`);
     if (isDisabled(next)) break;
     const sig = pageSignature();
+    const before = range ? range.start : -1;
     next.click();
-    const changed = await waitUntil(() => pageSignature() !== sig, 8000, 100);
+    const changed = await waitUntil(() => {
+      const r = readPagerRange();
+      return (r && r.start !== before) || pageSignature() !== sig;
+    }, 8000, 100);
     if (!changed) break;
+    await waitForTableSettled(3000);
   }
 
   onProgress(byKey.size, true);
