@@ -141,31 +141,51 @@ function pagerButtons(rangeEl) {
   // numbered page buttons.
   let el = rangeEl;
   for (let i = 0; el && i < 6; i += 1) {
-    const btns = Array.from(el.querySelectorAll('button, [role="button"], a'));
+    let btns = Array.from(el.querySelectorAll('button, [role="button"], a'));
     if (btns.some((b) => /^\d+$/.test(cleanText(b.textContent)))) return btns;
+    // Pagers built from plain divs/spans: page numbers are short numeric
+    // leaves; arrows are their sibling leaves with an icon.
+    const leaves = Array.from(el.querySelectorAll('div, span, li')).filter((n) => n.children.length <= 1 && cleanText(n.textContent).length <= 4);
+    if (leaves.filter((n) => /^\d+$/.test(cleanText(n.textContent))).length >= 2) {
+      const parent = leaves.find((n) => /^\d+$/.test(cleanText(n.textContent))).parentElement;
+      btns = Array.from(parent.children);
+      return btns;
+    }
     el = el.parentElement;
   }
   return [];
 }
 
-function findPagerButton(kind) {
+// Full pointer/mouse sequence for React handlers that ignore a bare click().
+function clickHard(el) {
+  const opts = { bubbles: true, cancelable: true, composed: true, view: window };
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    try { el.dispatchEvent(type.startsWith('pointer') ? new PointerEvent(type, opts) : new MouseEvent(type, opts)); } catch (e) { /* ignore */ }
+  }
+}
+
+let pagerPageSize = 0; // learned on page 1 ("1-40 of 571" -> 40)
+
+function findPagerButton(kind, preferArrow) {
   const range = readPagerRange();
   if (range) {
-    const pageSize = Math.max(1, range.end - range.start + 1);
-    const current = Math.floor((range.start - 1) / Math.max(1, pageSize)) + 1;
+    if (range.start === 1) pagerPageSize = Math.max(1, range.end - range.start + 1);
+    const pageSize = pagerPageSize || Math.max(1, range.end - range.start + 1);
+    const current = Math.floor((range.start - 1) / pageSize) + 1;
     const btns = pagerButtons(range.el);
     const byNumber = (n) => btns.find((b) => cleanText(b.textContent) === String(n)) || null;
+    // The arrow after the last numbered button (icon-only, so by position).
+    const lastNumIdx = btns.map((b) => /^\d+$/.test(cleanText(b.textContent))).lastIndexOf(true);
+    const arrowNext = lastNumIdx >= 0 && btns[lastNumIdx + 1] ? btns[lastNumIdx + 1] : null;
     if (kind === 'first') {
       if (range.start === 1) return null;
       return byNumber(1) || btns[0] || null;
     }
     if (range.end >= range.total) return null; // last page
+    if (preferArrow && arrowNext) return arrowNext;
     const numbered = byNumber(current + 1);
     if (numbered) return numbered;
-    // No visible button for the next number: the arrow after the last
-    // numbered button (icon-only, so found by position).
-    const lastNumIdx = btns.map((b) => /^\d+$/.test(cleanText(b.textContent))).lastIndexOf(true);
-    if (lastNumIdx >= 0 && btns[lastNumIdx + 1]) return btns[lastNumIdx + 1];
+    if (arrowNext) return arrowNext;
   }
   const labels = kind === 'next'
     ? ['button[aria-label*="next" i]', 'a[aria-label*="next" i]', 'button[title*="next" i]', '[data-testid*="next" i]']
@@ -232,8 +252,14 @@ async function paginateAndCollect(byKey, addRows, onProgress, shouldAbort, optio
     await waitForTableSettled(3000);
   }
 
+  let lastStart = -1;
+  let stuck = 0;
   for (let page = 0; page < MAX_PAGES; page += 1) {
     if (shouldAbort()) throw new Error('ABORTED');
+    // A page that is still loading shows no rows (or a hidden pager) for a
+    // moment; never read or judge it in that state.
+    await waitUntil(() => readPagerRange() && document.querySelectorAll(TABLE_ROW_SELECTOR).length > 0, 15000, 150);
+    await waitForTableSettled(4000);
     await sleep(150);
     await addRows(collectVisibleRows());
     await sleep(100);
@@ -242,18 +268,36 @@ async function paginateAndCollect(byKey, addRows, onProgress, shouldAbort, optio
     if (stopWhen && stopWhen()) break;
 
     const range = readPagerRange();
-    const next = findPagerButton('next');
-    debug(`[LinkedIn Resolver] Pager: ${range ? `${range.start}-${range.end} of ${range.total}` : 'no range text'}, next button ${next ? `<${next.tagName.toLowerCase()} "${cleanText(next.textContent).slice(0, 12)}">` : 'not found'}`);
-    if (isDisabled(next)) break;
-    const sig = pageSignature();
+    // The only real end: the range has reached the total.
+    if (range && range.end >= range.total) {
+      debug(`[LinkedIn Resolver] Pager: ${range.start}-${range.end} of ${range.total}, last page reached`);
+      break;
+    }
     const before = range ? range.start : -1;
-    next.click();
-    const changed = await waitUntil(() => {
+    const sig = pageSignature();
+    const moved = () => {
       const r = readPagerRange();
       return (r && r.start !== before) || pageSignature() !== sig;
-    }, 8000, 100);
-    if (!changed) break;
-    await waitForTableSettled(3000);
+    };
+
+    // Up to three attempts per page: numbered/arrow button with a plain
+    // click, then a full pointer event sequence, then the arrow by position.
+    let advanced = false;
+    for (let attempt = 0; attempt < 3 && !advanced; attempt += 1) {
+      const next = findPagerButton('next', attempt === 2);
+      debug(`[LinkedIn Resolver] Pager: ${range ? `${range.start}-${range.end} of ${range.total}` : 'no range text'}, attempt ${attempt + 1}, next button ${next ? `<${next.tagName.toLowerCase()} "${cleanText(next.textContent).slice(0, 12)}">` : 'not found'}`);
+      if (!next || isDisabled(next)) { await sleep(800); continue; }
+      if (attempt === 0) next.click(); else clickHard(next);
+      advanced = await waitUntil(moved, 8000, 100);
+    }
+    if (!advanced) {
+      stuck += 1;
+      debug(`[LinkedIn Resolver] Pager: could not advance past ${before} (stuck ${stuck})`);
+      if (stuck >= 2) break;
+      continue;
+    }
+    stuck = 0;
+    lastStart = before;
   }
 
   onProgress(byKey.size, true);
