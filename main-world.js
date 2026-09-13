@@ -185,10 +185,16 @@
     // request carries exactly the row id we just clicked. The request's own
     // headers are kept too: SPAs usually authenticate with a bearer header,
     // not a cookie, so replaying the URL alone would get a 401.
-    if (!apiTemplate && sessionActive && inFlight && u) {
-      const m = /[?&]searchResultId=([^&#]+)/.exec(u);
-      if (m && decodeURIComponent(m[1]) === inFlight.rowId) {
-        apiTemplate = u.replace(m[1], '{id}');
+    // The row id may travel under any parameter name (searchResultId on a
+    // search, something else on a Shortlist or Intake list), so the id
+    // itself is matched anywhere in an /api/ URL.
+    if (!apiTemplate && sessionActive && inFlight && u && inFlight.rowId) {
+      const rid = String(inFlight.rowId);
+      const enc = encodeURIComponent(rid);
+      const hit = u.includes(enc) ? enc : (u.includes(rid) ? rid : null);
+      const path = u.replace(/^https?:\/\/[^/]+/, '');
+      if (hit && /^\/?api\//.test(path)) {
+        apiTemplate = u.split(hit).join('{id}');
         apiHeaders = plainHeaders(input, init);
         log(`[LinkedIn Resolver] API learned from click: ${apiTemplate} (headers: ${Object.keys(apiHeaders).join(', ') || 'none'})`);
       }

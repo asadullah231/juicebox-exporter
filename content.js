@@ -3,9 +3,42 @@
 // results table and reports them to the popup. Never opens candidate
 // profiles, never fetches anything beyond what's already rendered.
 
-const ROW_SELECTOR = '.MuiDataGrid-row';
+// Search results and the project Shortlist / Intake pages all render a MUI
+// DataGrid, but not necessarily with the same wrapper classes, so every
+// selector has a role/attribute fallback.
+const ROW_SELECTOR = '.MuiDataGrid-row, [role="row"][data-id]';
 const SCROLLER_SELECTOR = '.MuiDataGrid-virtualScroller';
-const GRID_SELECTOR = '[role="grid"], .MuiDataGrid-root';
+const GRID_SELECTOR = '[role="grid"], .MuiDataGrid-root, [role="treegrid"]';
+
+// The element that actually scrolls the rows. MUI's virtual scroller when
+// present; otherwise the nearest scrollable ancestor of the first row; and
+// as a last resort the page itself (some layouts scroll the whole document).
+function findScroller() {
+  const mui = document.querySelector(SCROLLER_SELECTOR);
+  if (mui) return mui;
+  const row = document.querySelector(ROW_SELECTOR);
+  let el = row ? row.parentElement : null;
+  while (el && el !== document.body) {
+    const cs = getComputedStyle(el);
+    if (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight + 10) return el;
+    el = el.parentElement;
+  }
+  const doc = document.scrollingElement || document.documentElement;
+  return doc.scrollHeight > doc.clientHeight + 10 ? doc : null;
+}
+
+// What the popup shows when the page is Juicebox but nothing exportable is
+// found: which pieces were located, so the failure is specific.
+function pageDiag() {
+  return {
+    grid: !!document.querySelector(GRID_SELECTOR),
+    scroller: !!findScroller(),
+    rows: document.querySelectorAll(ROW_SELECTOR).length,
+    rowsWithId: document.querySelectorAll('[role="row"][data-id], .MuiDataGrid-row[data-id]').length,
+    nameCells: document.querySelectorAll('[data-field="full_name"], [data-field="name"], [data-field="fullName"]').length,
+    path: location.pathname,
+  };
+}
 
 function cleanText(value) {
   if (!value) return '';
@@ -58,13 +91,18 @@ function extractCompanyFromFiber(rowEl) {
 }
 
 function isJuiceboxResultsPage() {
-  return !!document.querySelector(GRID_SELECTOR);
+  return !!document.querySelector(GRID_SELECTOR) || document.querySelectorAll(ROW_SELECTOR).length > 0;
 }
 
 function getExpectedTotal() {
-  // "Matches (864)" heading — best-effort, used only for progress reporting.
-  for (const el of document.querySelectorAll('h1, h2, h3, h4')) {
-    const match = (el.textContent || '').match(/Matches\s*\((\d+)\)/i);
+  // "Matches (864)" heading on a search, "Shortlist (640)" / "Intake (12)" in
+  // the breadcrumb or sidebar of a project list. Best-effort, progress only.
+  const RE = /\b(?:Matches|Shortlist|Intake|Results|Candidates)\s*\(\s*(\d+)\s*\)/i;
+  for (const el of document.querySelectorAll('h1, h2, h3, h4, nav *, a, span, p, li, div')) {
+    if (el.children.length > 3) continue;
+    const t = (el.textContent || '').trim();
+    if (t.length > 60) continue;
+    const match = t.match(RE);
     if (match) return parseInt(match[1], 10);
   }
   const grid = document.querySelector(GRID_SELECTOR);
@@ -192,7 +230,7 @@ async function extractActualLinkedInUrl(rowEl) {
 // parallel callers do not race on a shared "last method" variable.
 async function resolveLinkedInUrlDetailed(rowEl) {
   const rowId = rowEl.getAttribute('data-id') || '';
-  const nameEl = rowEl.querySelector('[data-field="full_name"] p');
+  const nameEl = rowEl.querySelector('[data-field="full_name"] p, [data-field="full_name"], [data-field="name"] p, [data-field="name"], [data-field="fullName"]');
   const candidate = cleanText(nameEl?.textContent) || rowId || '(unknown)';
   const anchor = rowEl.querySelector('[data-field="profiles"] a[aria-label="LinkedIn"]');
   const domUrl = anchor?.getAttribute('href') || '';
@@ -288,7 +326,7 @@ function logSelectionShape(rowEl) {
 function extractRow(rowEl) {
   const id = rowEl.getAttribute('data-id') || null;
 
-  const nameEl = rowEl.querySelector('[data-field="full_name"] p');
+  const nameEl = rowEl.querySelector('[data-field="full_name"] p, [data-field="full_name"], [data-field="name"] p, [data-field="name"], [data-field="fullName"]');
   const name = cleanText(nameEl?.textContent);
 
   // What the DOM exposes (a people-search URL, or occasionally a real /in/
@@ -398,7 +436,7 @@ function setResolverSession(active) {
 }
 
 async function collectAllCandidates(onProgress, shouldAbort, onlySelected) {
-  const scroller = document.querySelector(SCROLLER_SELECTOR);
+  const scroller = findScroller();
   if (!scroller) {
     throw new Error('SCROLLER_NOT_FOUND');
   }
@@ -633,6 +671,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'PING') {
     sendResponse({
       isJuicebox: isJuiceboxResultsPage(),
+      pageDiag: pageDiag(),
       expectedTotal: getExpectedTotal(),
       extractionInProgress: !!activeExtraction,
       hasCachedResult: !!lastResult,

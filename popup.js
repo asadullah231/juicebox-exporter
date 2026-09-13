@@ -204,9 +204,9 @@ function downloadDebugLog(lines) {
 function messageForError(error) {
   switch (error) {
     case 'NOT_JUICEBOX_PAGE':
-      return 'Open a Juicebox search results page to export candidates.';
+      return 'Open a Juicebox search, Shortlist or Intake list to export candidates.';
     case 'SCROLLER_NOT_FOUND':
-      return 'Could not find the candidate results table on this page. Try reloading Juicebox.';
+      return 'Found candidate rows but no scrollable table around them. Reload Juicebox and try again; if it repeats, tick "Also save a debug log" and send the file.';
     case 'ALREADY_RUNNING':
       return 'An export is already in progress.';
     case 'ABORTED':
@@ -223,15 +223,25 @@ async function checkPage() {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const tab = tabs[0];
     if (!tab || !tab.url || !tab.url.startsWith('https://app.juicebox.ai/')) {
-      setStatus('Open a Juicebox search results page to export candidates.', 'error');
+      setStatus('Open a Juicebox search, Shortlist or Intake list to export candidates.', 'error');
       setButtonsEnabled(false);
       return;
     }
     currentTabId = tab.id;
 
     const response = await chrome.tabs.sendMessage(tab.id, { type: 'PING' }).catch(() => null);
-    if (!response || !response.isJuicebox) {
-      setStatus('Open a Juicebox search results page to export candidates.', 'error');
+    if (!response) {
+      setStatus('The extension is not loaded on this tab yet. Reload the Juicebox page and open this popup again.', 'error');
+      setButtonsEnabled(false);
+      return;
+    }
+    if (!response.isJuicebox) {
+      const d = response.pageDiag || {};
+      setStatus(
+        `No candidate table found on this page (${d.path || ''}): grid ${d.grid ? 'yes' : 'no'}, rows ${d.rows || 0}, name cells ${d.nameCells || 0}. ` +
+        'Open a search, Shortlist or Intake list with candidates visible, then try again.',
+        'error'
+      );
       setButtonsEnabled(false);
       return;
     }
@@ -271,7 +281,7 @@ async function checkPage() {
     setStatus(total ? `Ready. ${total} candidates listed on this search.` : 'Ready to export.');
     setButtonsEnabled(true);
   } catch (err) {
-    setStatus('Open a Juicebox search results page to export candidates.', 'error');
+    setStatus('Open a Juicebox search, Shortlist or Intake list to export candidates.', 'error');
     setButtonsEnabled(false);
   }
 }

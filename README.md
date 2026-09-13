@@ -14,7 +14,7 @@ candidate profile pages are opened.
 
 ## Use
 
-1. Open a Juicebox search results page (`app.juicebox.ai/project/.../search`)
+1. Open a Juicebox search results page, or a project Shortlist / Intake list (`app.juicebox.ai/project/.../search`, `/shortlist`, `/intake`)
 2. Click the extension icon
 3. Click **Export CSV** (or **Export Selected** if you've checked specific rows)
 4. Wait while it scrolls through the results — progress updates show the
